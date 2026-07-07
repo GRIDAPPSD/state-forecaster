@@ -1,0 +1,509 @@
+#!/usr/bin/python3
+# =====================================================
+# Change 3a — Piece 1: three-process scaffolding (STUBBED bodies).
+# feeder → (data queues) → trainer & forecaster; trainer → (model queue) → forecaster.
+# Verifies plumbing ONLY: paced feed, keep-all vs latest-only queues,
+# model-snapshot handoff, model-queue-first priority, DONE shutdown,
+# per-process log files. NO real training/forecasting yet (Pieces 2 & 3).
+# =====================================================
+import io
+import time
+import queue
+import logging
+from collections import deque
+from itertools import islice
+import json  # for emitting forecast JSON
+
+from forecaster_single import (
+    read_json_records, RollingBuffer, build_model, train_block,
+    extract_scaler_state, apply_scaler_state,
+    assemble_input_vector, build_forecast_json,
+    HIST, FUT, USE_CURRENT_PQ, TS_INCREMENT_SEC,
+    DAY_LAG_SEC, WEEK_LAG_SEC, RETENTION_SEC,
+    encode_phase, time_features, device,
+    JSON_PATH, BLOCK_SEC, VAL_FRACTION, utc_str,
+)
+import numpy as np
+import torch
+import torch.multiprocessing as mp
+
+# =====================================================
+# CONFIG (3a additions)
+# =====================================================
+#FEED_RATE_HZ = 4.0          # records/sec the feeder emits (real ~1; >1 speeds testing)
+FEED_RATE_HZ = 20.0          # records/sec the feeder emits (real ~1; >1 speeds testing)
+FORECASTER_POLL_SEC = 0.05  # forecaster idle poll interval when no work is pending
+LOG_DIR = "."
+TRAINER_LOG = f"{LOG_DIR}/trainer.log"
+FORECASTER_LOG = f"{LOG_DIR}/forecaster.log"
+FEEDER_LOG = f"{LOG_DIR}/feeder.log"
+
+DONE = "__DONE__"           # sentinel Queue item meaning "end of stream"
+
+# =====================================================
+# LOGGING (per-process: each process configures its own file + console)
+# =====================================================
+def setup_logger(name, logfile):
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    fmt = logging.Formatter("%(asctime)s [%(processName)s] %(message)s",
+                            datefmt="%H:%M:%S")
+    fh = logging.FileHandler(logfile, mode="w")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    ch = logging.StreamHandler()
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+    return logger
+
+# =====================================================
+# QUEUE HELPERS
+# =====================================================
+def drain_latest(q):
+    """Consumer-side drain: return (latest_non_DONE_item, saw_done).
+    Keeps only the newest real item; never discards a DONE marker.
+    Non-blocking; returns (None, False) if the queue was empty."""
+    latest = None
+    saw_done = False
+    try:
+        while True:
+            item = q.get_nowait()
+            if isinstance(item, str) and item == DONE:
+                saw_done = True
+            else:
+                latest = item
+    except queue.Empty:
+        pass
+    return latest, saw_done
+
+def drain_all(q):
+    """Drain ALL pending items in order. Returns (records_list, saw_done).
+    Used for the forecaster's keep-all data queue so history stays gapless."""
+    records = []
+    saw_done = False
+    try:
+        while True:
+            item = q.get_nowait()
+            if isinstance(item, str) and item == DONE:
+                saw_done = True
+            else:
+                records.append(item)
+    except queue.Empty:
+        pass
+    return records, saw_done
+
+# =====================================================
+# FEEDER PROCESS
+# Reads JSON one record at a time, paced by FEED_RATE_HZ.
+# Puts each record onto BOTH data queues:
+#   - trainer: keep-ALL FIFO       (plain put)
+#   - forecaster: keep-ALL FIFO    (plain put)
+# Sends DONE to both at EOF, then stops (no looping).
+# =====================================================
+def feeder_proc(train_data_q, fc_data_q, data_path):
+    log = setup_logger("feeder", FEEDER_LOG)
+    log.info(f"FEEDER start | path={data_path} | rate={FEED_RATE_HZ} Hz")
+    interval = 1.0 / FEED_RATE_HZ if FEED_RATE_HZ > 0 else 0.0
+    n = 0
+    last_ts = None
+    for record in read_json_records(data_path):
+        train_data_q.put(record)   # trainer: keep-all FIFO
+        fc_data_q.put(record)      # forecaster: keep-all FIFO (drains internally)
+        n += 1
+        last_ts = int(record["timestamp"])
+        if n % 500 == 0:
+            log.info(f"fed {n} records | latest_ts={utc_str(last_ts)}")
+        if interval:
+            time.sleep(interval)
+    train_data_q.put(DONE)
+    fc_data_q.put(DONE)
+    log.info(f"FEEDER done | total={n} records | last_ts="
+             f"{utc_str(last_ts) if last_ts else 'n/a'} | sent DONE")
+
+# =====================================================
+# TRAINER PROCESS  (STUB body)
+# Keep-all FIFO consume → own RollingBuffer. Lazy init on first record.
+# At each block boundary: push a model snapshot (CPU state_dict + version).
+# Real training loop arrives in Piece 2.
+# =====================================================
+def snapshot_to_bytes(model, buf, version):
+    """Serialize weights + scaler state to a bytes blob for cross-process
+    transport. The scalers travel WITH the model so the forecaster normalizes
+    inputs exactly as the trainer did."""
+    sd = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+    buf_io = io.BytesIO()
+    torch.save({"weights": sd,
+                "scaler_state": extract_scaler_state(buf)}, buf_io)
+    return {"version": version, "blob": buf_io.getvalue()}
+
+def trainer_train_block(buf, model, optimizer, scheduler, criterion, scaler_amp,
+                        block_start, block_end, block_id, version, model_q, log):
+    """Real per-block training (mirrors Step B process_block, sans forecast)."""
+    # 1) causal scaler update using ONLY this block's raw values
+    buf.update_scalers_with_block(block_start, block_end)
+    # 2) rebuild normalized tensors from raw buffers with updated scalers
+    buf.rebuild_normalized()
+    # 3) build training set from the whole retained buffer (subsampled)
+    train_idx = buf.build_training_indices()
+    np.random.shuffle(train_idx)
+    n_val = int(len(train_idx) * VAL_FRACTION)
+    val_idx = train_idx[:n_val]
+    tr_idx = train_idx[n_val:]
+    log.info(f"[TRAIN] block {block_id} {utc_str(block_start)} → {utc_str(block_end)} "
+             f"| train={len(tr_idx)} val={len(val_idx)}")
+    if len(tr_idx) == 0:
+        log.info(f"  block {block_id}: no training samples — pushing current weights")
+    else:
+        # train_block logs epoch/loss via log.info → lands in trainer.log
+        train_block(model, optimizer, scheduler, criterion, scaler_amp,
+                    tr_idx, val_idx, buf, block_id, log=log.info)
+    # 4) push the TRAINED snapshot (bytes transport)
+    model_q.put(snapshot_to_bytes(model, buf, version))
+    log.info(f"pushed model snapshot v{version}")
+    # 5) evict rows older than the retention horizon
+    buf.evict_old()
+
+
+def trainer_proc(train_data_q, model_q):
+    log = setup_logger("trainer", TRAINER_LOG)
+    log.info("TRAINER start")
+    buf = None
+    model = optimizer = scheduler = criterion = scaler_amp = None
+    block_start = None
+    block_end = None
+    block_id = 0
+    version = 0
+
+    while True:
+        item = train_data_q.get()  # blocking; keep-all FIFO
+        if isinstance(item, str) and item == DONE:
+            # finalize trailing block if it holds data
+            if (buf is not None and buf.newest_ts is not None
+                    and buf.newest_ts >= block_start):
+                block_id += 1
+                version += 1
+                log.info(f"finalizing trailing block {block_id} on DONE")
+                trainer_train_block(buf, model, optimizer, scheduler, criterion,
+                                    scaler_amp, block_start, block_end, block_id,
+                                    version, model_q, log)
+            model_q.put(DONE)
+            log.info("TRAINER received DONE → sent DONE to model queue → exit")
+            return
+
+        record = item
+        ts = int(record["timestamp"])
+
+        # lazy init from first record (keep ALL build_model returns now)
+        if buf is None:
+            node_names = sorted(record["nodes"].keys())
+            buf = RollingBuffer(node_names)
+            model, optimizer, scheduler, criterion, scaler_amp = build_model(buf.num_nodes)
+            block_start = ts
+            block_end = block_start + BLOCK_SEC
+            log.info(f"lazy-init | {buf.num_nodes} nodes | first_ts={utc_str(ts)} "
+                     f"| block_end={utc_str(block_end)}")
+
+        # close out any completed block(s) before ingesting this record
+        while ts >= block_end:
+            block_id += 1
+            version += 1
+            trainer_train_block(buf, model, optimizer, scheduler, criterion,
+                                scaler_amp, block_start, block_end, block_id,
+                                version, model_q, log)
+            block_start = block_end
+            block_end = block_start + BLOCK_SEC
+
+        buf.append_record(record)
+
+
+# =====================================================
+# FORECASTER PROCESS  (STUB body)
+# Latest-only DATA consume → own RollingBuffer. Lazy init on first record.
+# Each loop: check MODEL queue FIRST (load newest, honor DONE), then take
+# latest data record and "forecast" (stub logs). Real forecast+JSON in Piece 3.
+# =====================================================
+FORECAST_LOG_EVERY = 200   # stub: log 1 of every N forecasts (avoids per-poll flood)
+
+def normalize_row(scalers, V, ang, P, Q, ts):
+    """Normalize one raw row into [V,ang,P,Q,sin,cos] float32 using given scalers.
+    scalers = (sc_V, sc_ang, sc_P, sc_Q)."""
+    sc_V, sc_ang, sc_P, sc_Q = scalers
+    Vn = float(sc_V.transform(np.array([V], dtype=np.float64))[0])
+    an = float(sc_ang.transform(np.array([ang], dtype=np.float64))[0])
+    Pn = float(sc_P.transform(np.array([P], dtype=np.float64))[0])
+    Qn = float(sc_Q.transform(np.array([Q], dtype=np.float64))[0])
+    s, c = time_features(int(ts))
+    return np.array([Vn, an, Pn, Qn, s, c], dtype=np.float32)
+
+
+class NormStore:
+    """Forecaster-side normalized history. Per node: an ordered deque of
+    (ts, norm_row) for the position-based HIST window, and a {ts: norm_row}
+    dict for O(1) lag lookups. Incremental on append; full rebuild only when
+    scalers change (snapshot arrival)."""
+    def __init__(self, num_nodes):
+        self.num_nodes = num_nodes
+        self.rows = {nid: deque() for nid in range(num_nodes)}     # (ts, norm_row)
+        self.by_ts = {nid: {} for nid in range(num_nodes)}         # ts -> norm_row
+
+    def append(self, nid, ts, norm_row):
+        self.rows[nid].append((ts, norm_row))
+        self.by_ts[nid][ts] = norm_row
+
+    def evict_before(self, cutoff_ts):
+        for nid in range(self.num_nodes):
+            dq = self.rows[nid]
+            bt = self.by_ts[nid]
+            while dq and dq[0][0] < cutoff_ts:
+                old_ts, _ = dq.popleft()
+                bt.pop(old_ts, None)
+
+    def rebuild_from_raw(self, buf, scalers):
+        """Full re-normalize of everything currently in buf.raw with new scalers.
+        Called once per snapshot arrival (rare)."""
+        for nid in range(self.num_nodes):
+            self.rows[nid].clear()
+            self.by_ts[nid].clear()
+            for (ts, V, ang, P, Q) in buf.raw[nid]:
+                nr = normalize_row(scalers, V, ang, P, Q, ts)
+                self.rows[nid].append((ts, nr))
+                self.by_ts[nid][ts] = nr
+
+
+def forecast_latest(model, store, buf, latest_ts, log):
+    """Produce a forecast for base timestamp latest_ts across all nodes.
+    Returns a preds array + parallel nid list for build_forecast_json, or None
+    if no node has enough history yet."""
+    X_list, nid_list = [], []
+
+    for nid in range(store.num_nodes):
+        dq = store.rows[nid]
+        if len(dq) < HIST + 1:
+            continue  # not enough consecutive history yet
+
+        # last HIST+1 rows: the final one is the base (latest_ts), the prior HIST are history
+        recent = list(islice(reversed(dq), 0, HIST + 1))  # newest-first, length HIST+1
+        recent.reverse()                                   # oldest-first
+        base_ts, base_row = recent[-1]
+        if base_ts != latest_ts:
+            continue  # this node has no row exactly at latest_ts (gap) — skip it
+
+        hist_rows = recent[:HIST]                          # HIST rows before base
+        hist_va = torch.tensor(
+            np.concatenate([r[0:2] for (_, r) in hist_rows]), dtype=torch.float32)
+
+        base_np = base_row if USE_CURRENT_PQ else recent[-2][1]
+        base_pq = torch.tensor(base_np[2:4], dtype=torch.float32)
+
+        day_np = store.by_ts[nid].get(latest_ts - DAY_LAG_SEC, None)
+        week_np = store.by_ts[nid].get(latest_ts - WEEK_LAG_SEC, None)
+        day_row = torch.tensor(day_np, dtype=torch.float32) if day_np is not None else None
+        week_row = torch.tensor(week_np, dtype=torch.float32) if week_np is not None else None
+
+        time_feat = torch.tensor(base_row[4:6], dtype=torch.float32)
+        phase = buf.phase[nid]
+
+        X = assemble_input_vector(hist_va, base_pq, day_row, week_row, phase, time_feat)
+        X_list.append(X)
+        nid_list.append(nid)
+
+    if not X_list:
+        return None
+
+    X_batch = torch.stack(X_list).to(device)
+    nid_batch = torch.tensor(nid_list, dtype=torch.long, device=device)
+    model.eval()
+    with torch.no_grad():
+        preds = model(X_batch, nid_batch).cpu().numpy()
+
+    nids = np.array(nid_list)
+    base_ts_arr = np.full(len(nid_list), latest_ts, dtype=np.int64)
+    return preds, nids, base_ts_arr
+
+
+def forecaster_proc(fc_data_q, model_q):
+    log = setup_logger("forecaster", FORECASTER_LOG)
+    log.info("FORECASTER start")
+
+    buf = None            # RollingBuffer (raw history + scalers + phase)
+    model = None
+    store = None          # NormStore (incremental normalized rows)
+    scalers = None        # (sc_V, sc_ang, sc_P, sc_Q) — refs into buf's scalers
+    have_scalers = False  # True once first snapshot applied
+    current_version = 0
+    pending_snap = None
+    data_done = False
+    fc_count = 0
+    warmup_logged = False
+
+    def ingest(record):
+        """Append raw to buf; if scalers known, incrementally normalize into store."""
+        ts = int(record["timestamp"])
+        buf.append_record(record)   # updates buf.raw + buf.newest_ts
+        if have_scalers:
+            for node_name, vals in record["nodes"].items():
+                nid = buf.node_to_id.get(node_name)
+                if nid is None:
+                    continue
+                P = vals["P"] if vals["P"] is not None else 0.0
+                Q = vals["Q"] if vals["Q"] is not None else 0.0
+                nr = normalize_row(scalers, vals["V"], vals["Angle"], P, Q, ts)
+                store.append(nid, ts, nr)
+
+    def evict():
+        if buf.newest_ts is None:
+            return
+        cutoff = buf.newest_ts - RETENTION_SEC
+        buf.evict_old()                 # raw
+        if store is not None:
+            store.evict_before(cutoff)  # normalized
+
+    while True:
+        # 1) MODEL QUEUE FIRST: adopt newest snapshot (weights + scalers), honor DONE.
+        snap, model_saw_done = drain_latest(model_q)
+        if snap is not None:
+            if buf is None:
+                pending_snap = snap   # arrived before first data; apply after init
+            else:
+                blob = torch.load(io.BytesIO(snap["blob"]), map_location="cpu")
+                model.load_state_dict(blob["weights"])
+                apply_scaler_state(buf, blob["scaler_state"])
+                store.rebuild_from_raw(buf, scalers)   # full re-normalize (rare)
+                have_scalers = True
+                current_version = snap["version"]
+                log.info(f"adopted snapshot v{current_version} "
+                         f"→ scalers updated, store re-normalized "
+                         f"({sum(len(store.rows[n]) for n in range(store.num_nodes))} rows)")
+
+        # 2) DATA QUEUE: drain ALL (keep-all, gapless), ingest in order.
+        records, data_saw_done = drain_all(fc_data_q)
+        if data_saw_done:
+            data_done = True
+
+        latest_ts = None
+        for record in records:
+            if buf is None:
+                # lazy init from first record
+                node_names = sorted(record["nodes"].keys())
+                buf = RollingBuffer(node_names)
+                model, *_ = build_model(buf.num_nodes)
+                store = NormStore(buf.num_nodes)
+                scalers = (buf.sc_V, buf.sc_ang, buf.sc_P, buf.sc_Q)
+                log.info(f"lazy-init | {buf.num_nodes} nodes | "
+                         f"first_ts={utc_str(int(record['timestamp']))}")
+                if pending_snap is not None:
+                    blob = torch.load(io.BytesIO(pending_snap["blob"]),
+                                      map_location="cpu")
+                    model.load_state_dict(blob["weights"])
+                    apply_scaler_state(buf, blob["scaler_state"])
+                    have_scalers = True
+                    current_version = pending_snap["version"]
+                    log.info(f"applied held snapshot v{current_version}")
+                    pending_snap = None
+            ingest(record)
+            latest_ts = int(record["timestamp"])
+
+        # keep memory bounded
+        if records:
+            evict()
+
+        # 3) FORECAST the latest timestamp (only if we have a trained model).
+        if latest_ts is not None:
+            if have_scalers:
+                result = forecast_latest(model, store, buf, latest_ts, log)
+                if result is not None:
+                    preds, nids, base_ts_arr = result
+                    fc_count += 1
+                    fc_json = build_forecast_json(preds, nids, base_ts_arr, buf,
+                                                  base_time=latest_ts)
+                    # emit JSON (this is the bus-publish unit). Log judiciously.
+                    if fc_count == 1 or fc_count % FORECAST_LOG_EVERY == 0:
+                        log.info(f"[FORECAST] #{fc_count} base_time={utc_str(latest_ts)} "
+                                 f"model v{current_version} | "
+                                 f"{len(fc_json['nodes'])} nodes")
+                        # full JSON only occasionally to keep the log readable
+                        log.info(json.dumps(fc_json))
+            else:
+                if not warmup_logged:
+                    log.info(f"latest_ts={utc_str(latest_ts)} | no model yet "
+                             f"(warm-up) — ingesting only until first snapshot")
+                    warmup_logged = True
+
+        # 4) shutdown when BOTH streams exhausted.
+        if data_done and model_saw_done:
+            log.info(f"FORECASTER received DONE on both queues → exit "
+                     f"(total forecasts: {fc_count}, final model v{current_version})")
+            return
+
+        # 5) avoid busy-spin when idle
+        if not records and snap is None:
+            time.sleep(FORECASTER_POLL_SEC)
+
+
+# =====================================================
+# MAIN — spawn the three processes, wire the queues.
+# =====================================================
+def main():
+    mp.set_start_method("spawn", force=True)  # required for CUDA + multiprocessing
+
+    # --- Queues ---
+    # Trainer data: keep-ALL FIFO (unbounded). Every record must be retained
+    #   so the trainer's RollingBuffer has no gaps.
+    # Forecaster data: keep-ALL FIFO (unbounded). Every record must be retained
+    # Model: trainer PUTs snapshots; forecaster GETs. Latest-only via
+    #   drain_latest on the consumer side (unbounded; snapshots are infrequent).
+    train_data_q = mp.Queue()
+    fc_data_q = mp.Queue()
+    model_q = mp.Queue()
+
+    procs = [
+        mp.Process(target=feeder_proc,
+                   args=(train_data_q, fc_data_q, JSON_PATH),
+                   name="feeder"),
+        mp.Process(target=trainer_proc,
+                   args=(train_data_q, model_q),
+                   name="trainer"),
+        mp.Process(target=forecaster_proc,
+                   args=(fc_data_q, model_q),
+                   name="forecaster"),
+    ]
+
+    print(f"[MAIN] spawning {len(procs)} processes "
+          f"(feeder rate={FEED_RATE_HZ} Hz). Logs: "
+          f"{FEEDER_LOG}, {TRAINER_LOG}, {FORECASTER_LOG}")
+    print("[MAIN] tip: `tail -f trainer.log` and `tail -f forecaster.log` "
+          "in separate terminals.")
+
+    for p in procs:
+        p.start()
+
+    try:
+        # Normal shutdown: feeder finishes → sends DONE → trainer finalizes and
+        # sends DONE to model queue → forecaster sees DONE on both → all exit.
+        for p in procs:
+            p.join()
+        bad = [p for p in procs if p.exitcode not in (0, None)]
+        if bad:
+            print(f"[MAIN] processes exited with errors: "
+                  f"{[(p.name, p.exitcode) for p in bad]}")
+        else:
+            print("[MAIN] all processes exited cleanly.")
+    except KeyboardInterrupt:
+        # Ctrl-C: tear down children so we don't leave orphans.
+        print("\n[MAIN] KeyboardInterrupt → terminating child processes...")
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+        for p in procs:
+            p.join(timeout=5)
+        print("[MAIN] shutdown complete.")
+    finally:
+        # Report any non-zero exit codes (a crashed child shows up here).
+        for p in procs:
+            if p.exitcode not in (0, None):
+                print(f"[MAIN] WARNING: {p.name} exited with code {p.exitcode}")
+
+
+if __name__ == "__main__":
+    main()
