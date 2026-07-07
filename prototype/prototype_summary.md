@@ -1,11 +1,11 @@
 
 # State Forecaster — Prototype Summary
 
-Last updated: July 7, 2026
-Authors: Gary Black and Anthropic Claude Opus 4.8 (AI used for design reasoning and code development starting from forecasting neural network algorithm code by Avijit Das)
+- Last updated: July 7, 2026
+- Authors: Gary Black and Anthropic Claude Opus 4.8 (AI used for design reasoning and code development starting from forecasting neural network algorithm code by Avijit Das)
 
 ## 1. Purpose of this document
-Captures the design, rationale, current status, features, assumptions, and limitations of the **State Forecaster** application. Intended for: (a) the project lead and the original neural-network developer, to understand *what was built and why*; (b) future development sessions, to resume work with full context. It also frames the decision of whether the app is ready for GridAPPS-D integration or whether specific features/limitations should be addressed first.
+Captures the design, rationale, current status, features, assumptions, and limitations of the prototype **State Forecaster** application. Intended to (a) understand *what was built and why*; (b) future development sessions, to resume work with full context. It also frames the decision of whether the app is ready for GridAPPS-D integration or whether specific features/limitations should be addressed first.
 
 ## 2. What the app is and where it sits
 The **State Forecaster** is a Python application that forecasts near-future distribution-system state (per-phase-node **Voltage magnitude (pu)**, **Angle (rad)**) from a stream of state estimates. Production data pipeline:
