@@ -5,7 +5,7 @@
 - Authors: Gary Black and Anthropic Claude Opus 4.8 (AI used for design reasoning and code development starting from forecasting neural network algorithm code by Avijit Das)
 
 ## 1. Purpose of this document
-Captures the design, rationale, current status, features, assumptions, and limitations of the prototype **State Forecaster** application. Intended to (a) understand *what was built and why*; (b) future development sessions, to resume work with full context. It also frames the decision of whether the app is ready for GridAPPS-D integration or whether specific features/limitations should be addressed first.
+Captures the design, rationale, current status, features, assumptions, and limitations of the prototype **State Forecaster** application. Intended to (a) understand *what was built and why*; (b) future development sessions, to resume AI work with full context. It also frames the decision of whether the app is ready for GridAPPS-D integration or whether specific features/limitations should be addressed first.
 
 ## 2. What the app is and where it sits
 The **State Forecaster** is a Python application that forecasts near-future distribution-system state (per-phase-node **Voltage magnitude (pu)**, **Angle (rad)**) from a stream of state estimates. Production data pipeline:
@@ -18,17 +18,17 @@ GridLAB-D / OpenDSS (simulation measurements)
 ```
 - The State Estimator is the only C++ app in GridAPPS-D (chosen because Python/Julia sparse-matrix libraries didn't scale to required matrix dimensions). It uses its own queue-draining/**averaging** design to avoid falling behind when estimates are slow to produce.
 - The values the Forecaster ingests are **State Estimator outputs**, one bus message per timestamp.
-- **Origin:** started from a validated single-process NN script (written by a colleague to validate the forecasting approach and support a journal paper). This project's task is to turn that into a **bus-integrated, streaming ADMS service**.
+- **Origin:** started from a validated single-process NN script (written by Avijit Das to validate the forecasting approach and support a journal paper). This project's deliverable is to turn that into a **bus-integrated, streaming ADMS service**.
 
 **Test grids:** IEEE 13 Node feeder → **41 phase-nodes**; IEEE 123 Node feeder → **274 phase-nodes**. ("Node" is the official IEEE name for *locations*; expanding to per-phase electrical points gives the larger phase-node counts the model actually operates on.) A 9500-node model exists but is **explicitly out of scope** (see §10).
 
 ## 3. Current status (headline)
-- **Changes 1, 2 (Steps A & B), and 3 are complete and validated.** The app now runs as **three concurrent processes** (feeder → trainer + forecaster) simulating streaming ingestion, with training and forecasting happening simultaneously and forecasts produced per incoming estimate.
+- **Changes 1, 2 (Steps A & B), and 3 are complete and validated.** The prototype app now runs as **three concurrent processes** (feeder → trainer + forecaster) simulating streaming ingestion, with training and forecasting happening simultaneously and forecasts produced per incoming estimate.
 - **Not yet done:** GridAPPS-D bus integration (the feeder's file-read would be replaced by a bus subscription; forecasts would be published to the bus).
 - Validated on both 13-node and 123-node feeders.
 
 ## 4. Why the single-process → multi-process transformation was a major effort
-This is the central point for the team. The original code and the final architecture solve the *same forecasting math*, but under **fundamentally different systems constraints**. The original script had the luxury of **global, upfront knowledge**; the production shape has **none of it**. Nearly every subsystem had to be re-engineered as a result:
+The original code and the final architecture solve the *same forecasting math*, but under **fundamentally different systems constraints**. The original script had the luxury of **global, upfront knowledge**; the production shape has **none of it**. Nearly every subsystem had to be re-engineered as a result:
 
 | Concern | Original (single process, read whole file) | Now (streaming, three processes) |
 |---|---|---|
@@ -46,9 +46,9 @@ The recurring theme: **removing "global knowledge" forces every component that r
 ## 5. Development history (stages, in order)
 1. **Change 1 — forecast after every block.** Original trained 6 two-day blocks then forecast once; changed to forecast after each block (cumulative model). Restructured into functions.
 2. **Removed MC-dropout + Excel export.** Forecast became a fast single forward pass (`eval()`+`no_grad()`). Dropout kept only as training regularization.
-3. **Step A — data source CSV+pandas → JSON**, all other logic held identical. Routed through a `read_json_records()` generator (the "streaming seam"). Removed `deg2rad` (angle already radians in JSON). **Validation: 13-node output byte-identical to the CSV version.**
+3. **Change 2, Step A — data source CSV+pandas → JSON**, all other logic held identical. Routed through a `read_json_records()` generator (the "streaming seam"). Removed `deg2rad` (angle already radians in JSON). **Validation: 13-node output byte-identical to the CSV version.**
    - A standalone `csv_to_jsonl.py` converter was written (stdlib only) producing line-delimited JSON: `{"timestamp": epoch, "nodes": {node: {P,Q,V,Angle}}}`, Angle in radians.
-4. **Step B — true streaming ingestion.** pandas removed from data path. Added: **RollingBuffer** (per-node raw ring, retention/eviction), **incremental scalers** (RunningMinMax for P/Q/V, RunningStandardizer/Welford for Angle), **forecast-then-train** ordering per block, emergent warm-up. Continual train/forecast over all data (7 blocks on the 14-day set) — the correct shape for an open-ended live run. **Validation: matched Step A accuracy on both 13- and 123-node feeders** (not byte-identical—incremental scalers legitimately differ—but Voltage MAE within a few percent per aligned forecast).
+4. **Change 2, Step B — true streaming ingestion.** pandas removed from data path. Added: **RollingBuffer** (per-node raw ring, retention/eviction), **incremental scalers** (RunningMinMax for P/Q/V, RunningStandardizer/Welford for Angle), **forecast-then-train** ordering per block, emergent warm-up. Continual train/forecast over all data (7 blocks on the 14-day set) — the correct shape for an open-ended live run. **Validation: matched Step A accuracy on both 13- and 123-node feeders** (not byte-identical—incremental scalers legitimately differ—but Voltage MAE within a few percent per aligned forecast).
 5. **Per-node forecast JSON output.** Added `build_forecast_json()` producing the single-base-timestamp, all-nodes, FUT-horizon structure in **physical units, epoch seconds** — the eventual bus-publish unit. Validated via three-phase angle structure (~0 / −120° / +120°).
 6. **Change 3 — three-process split** (delivered in Pieces 1→3, each validated before the next):
    - **Piece 1:** three-process scaffolding with stubbed bodies — proved concurrency plumbing (spawn, queues, model handoff, DONE shutdown, per-process logs).
@@ -75,7 +75,7 @@ The recurring theme: **removing "global knowledge" forces every component that r
 - **"Latest-only" moved *inside* the forecaster.** Early design had the forecaster's *data queue* be latest-only. **Corrected:** the forecaster must ingest **every** estimate to keep its recent-history window **gapless** (the model needs the recent trajectory, e.g. up to ~2 days of estimates accumulate after the last model snapshot). So it *keeps all data* but *forecasts only the newest timestamp* — discarding stale **forecast opportunities**, not stale **data**.
 - **Model handoff = serialized bytes blob, NOT `share_memory()`.** `share_memory()` would let the forecaster read half-updated weights mid-optimizer-step and would require locking the training loop. Instead the trainer serializes a **consistent snapshot at a clean block boundary** (weights + scaler state) via `torch.save` to bytes. **A real bug was hit and fixed here:** transporting live torch tensors across a Queue uses shared-memory file descriptors owned by the sender; when the trainer exited with a snapshot still in flight, the receiver got `FileNotFoundError`. Bytes-blob transport eliminated this.
 - **Scaler state travels *with* the model.** The forecaster does **not** fit scalers; it applies the trainer's. This keeps train/forecast normalization identical and keeps the forecaster minimal (a stated design goal: "as much as possible in the trainer").
-- **Sentinel `DONE`** is a distinguished **queue item** (not an OS signal) marking end-of-stream for clean shutdown. In production the feeder derives this from the simulation's "closed" log message (or a State-Estimator-supplied end marker).
+- **Sentinel `DONE`** is a distinguished **queue item** marking end-of-stream for clean shutdown. In production the feeder derives this from the simulation's "closed" log message (or a State-Estimator-supplied end marker).
 - **`spawn` start method** (required for CUDA + multiprocessing); each process inits CUDA independently.
 - **Per-process log files** (`feeder.log`, `trainer.log`, `forecaster.log`) so each is independently `tail -f`-able. Forecaster logs judiciously (not per-poll) to bound log volume.
 
@@ -87,7 +87,7 @@ The recurring theme: **removing "global knowledge" forces every component that r
 - Node set is discovered from the **first streamed record** (`sorted(node keys)` → identical mapping across processes, robust to which record each sees first). **The app makes NO CIM/topology queries.** Rationale: the State Estimator queries CIM because it builds a physical network model; the Forecaster only needs "what nodes exist, in what order," which the estimate stream already carries. This minimizes ADMS coupling, keeps it testable offline, and keeps it portable to real field grids. (Escape hatch noted in §9.)
 
 ## 8. The retention-horizon change: 8 → 10 days (why it was necessary)
-This is worth explaining carefully because the reasoning is subtle and the team will want it.
+This is worth explaining carefully because the reasoning is subtle and is a deviation from Avijit's original code.
 
 **Original value (8 days), and its logic:** Distribution load has a strong **weekly trend**, so the buffer must retain **≥ 7 days** for the **1-week lag feature** to be populated (rather than zero-flagged). Eight days was chosen as "7 days for the weekly trend, rounded up to an even multiple of the 2-day training block" → exactly **4 blocks**. This reasoning was correct *for training-sample construction*, but it only accounted for the lag needed at the **most recent** point in the buffer.
 
@@ -122,7 +122,7 @@ The **centralized** Forecaster is appropriate up through ~123-node/274-phase-nod
 **Candidate work, in rough priority order — for the team to decide:**
 - **(A) Proceed to GridAPPS-D integration (Change 3c)?** The architecture is shaped for it. Gating question: are the §9 assumptions (esp. #1 fixed/complete node set, #2 gapless timestamps) acceptable for the *initial* integration target (GridLAB-D-driven, where they hold)? If yes, integration can start.
 - **(B) Timestamp-gap robustness (§9.2)** — needed before trusting large-node or field data; not needed for small-feeder GridLAB-D integration.
-- **(C) Optional accuracy-vs-actual evaluation mode (§9.5)** — have the forecaster log/compare its forecast against the real estimate when that timestamp later arrives, producing live MAE. Valuable for the *evaluation* phase and for the paper; not required for integration to function.
+- **(C) Optional accuracy-vs-actual evaluation mode (§9.5)** — have the forecaster log/compare its forecast against the real estimate when that timestamp later arrives, producing live MAE. Valuable for the *evaluation* phase; not required for integration to function.
 - **(D) Node-set-from-CIM escape hatch (§9.1)** — only if/when targeting real field data or non-uniform node sets. Deliberately deferred.
 - **(E) Forecast horizon tuning (`FUT`, §9.3)** and **retention/cap tuning (§9.4)** — evaluation-phase knobs, best tuned once running against the live (or live-like) feed where their real impact is measurable.
 - **(F) Full re-normalize cost at scale (§7)** — the per-snapshot full buffer re-normalize is O(retained rows); fine at 274 nodes, worth profiling if pushing toward thousands. Micro-optimizations (cache time-features, pre-tensorize lags) are structured to be easy to add if profiling ever demands it.
