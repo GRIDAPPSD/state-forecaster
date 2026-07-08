@@ -1,5 +1,5 @@
 
-# State Forecaster — Prototype Summary
+# State Forecaster App — Prototype Summary
 
 - Last updated: July 7, 2026
 - Authors: Gary Black and Anthropic Claude Opus 4.8 (AI used for design reasoning and code development starting from forecasting neural network algorithm code by Avijit Das)
