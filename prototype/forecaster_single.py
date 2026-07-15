@@ -20,9 +20,12 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 # =====================================================
 JSON_PATH = "results_data_forecasting_13.json"
 #JSON_PATH = "results_data_forecasting_123.json"
+#JSON_PATH = "gappy_13.json"
 
 # --- streaming cadence ---
 TS_INCREMENT_SEC = 60          # timestamp spacing in the input stream (1 min)
+#TS_INCREMENT_SEC = 300          # timestamp spacing in the input stream (5 min)
+#TS_INCREMENT_SEC = 900          # timestamp spacing in the input stream (15 min)
 
 # --- history / horizon (in SAMPLES, i.e. timestamps) ---
 HIST = 15                      # past samples used as input (15 min @ 1-min)
@@ -105,6 +108,83 @@ def read_json_records(path):
             if not line:
                 continue
             yield json.loads(line)
+
+
+def impute_missing_records(source, increment_sec):
+    """Wrap a record source to yield a gapless, grid-aligned stream.
+
+    Incoming record timestamps are assumed to be multiples of increment_sec
+    (grid-aligned). When two consecutive REAL records are more than one
+    increment apart, linearly-interpolated placeholder records are synthesized
+    for each missing grid-aligned timestamp and yielded IMMEDIATELY BEFORE the
+    real record that triggered them — i.e. a "burst": [imp, imp, ..., real].
+
+    Design points (see project discussion):
+      * NO leading imputation: nothing is emitted before the first real record.
+        The first real record is effectively "time zero" for forecasting.
+      * Imputation only happens once the FORWARD (later) real record is in hand,
+        so each imputed record is emitted in the same burst as its trigger.
+      * Each imputed record carries "_imputed": True; real records carry
+        "_imputed": False. Downstream code that only reads "timestamp"/"nodes"
+        is unaffected; the flag lets the forecaster skip forecasting on imputed
+        data while still ingesting it to keep history gapless.
+      * Interpolation is linear per node for P, Q, V, Angle. (Safe for angle
+        here because per-phase angles cluster near 0 / ±2.09 rad, far from the
+        ±pi wraparound.)
+    """
+    prev_ts = None
+    prev_nodes = None
+
+    for record in source:
+        ts = int(record["timestamp"])
+
+        if prev_ts is not None:
+            delta = ts - prev_ts
+            if delta <= 0:
+                # Non-increasing timestamp: unexpected. Pass through untouched;
+                # don't attempt imputation across a non-forward step.
+                print(f"[IMPUTE] WARNING: non-increasing timestamp "
+                      f"{prev_ts} -> {ts}; passing through without imputation.")
+            elif delta % increment_sec != 0:
+                # Not grid-aligned: violates the stated assumption. Don't
+                # fabricate misaligned rows; pass the real record through and
+                # log so it's visible.
+                print(f"[IMPUTE] WARNING: gap {delta}s not a multiple of "
+                      f"increment {increment_sec}s ({prev_ts} -> {ts}); "
+                      f"no imputation for this gap.")
+            else:
+                gap_steps = delta // increment_sec
+                if gap_steps > 1:
+                    # Synthesize gap_steps - 1 imputed records along the line
+                    # from prev_nodes -> record["nodes"].
+                    for k in range(1, gap_steps):
+                        frac = k / gap_steps
+                        imp_ts = prev_ts + k * increment_sec
+                        imp_nodes = {}
+                        for node_name, cur_vals in record["nodes"].items():
+                            prev_vals = prev_nodes.get(node_name)
+                            if prev_vals is None:
+                                # Node absent in previous record (shouldn't
+                                # happen with fixed node set); fall back to
+                                # current values rather than crash.
+                                imp_nodes[node_name] = dict(cur_vals)
+                            else:
+                                imp_nodes[node_name] = {
+                                    "P": prev_vals["P"] + frac * (cur_vals["P"] - prev_vals["P"]),
+                                    "Q": prev_vals["Q"] + frac * (cur_vals["Q"] - prev_vals["Q"]),
+                                    "V": prev_vals["V"] + frac * (cur_vals["V"] - prev_vals["V"]),
+                                    "Angle": prev_vals["Angle"] + frac * (cur_vals["Angle"] - prev_vals["Angle"]),
+                                }
+                        yield {"timestamp": imp_ts,
+                               "nodes": imp_nodes,
+                               "_imputed": True}
+
+        # Emit the real record (tagged as non-imputed).
+        record["_imputed"] = False
+        yield record
+
+        prev_ts = ts
+        prev_nodes = record["nodes"]
 
 # =====================================================
 # TIME FEATURES (from epoch seconds; no pandas)
@@ -592,7 +672,7 @@ def process_block(model, opt, sched, crit, amp, buf,
     buf.evict_old()
 
 def run(data_path):
-    source = read_json_records(data_path)
+    source = impute_missing_records(read_json_records(data_path), TS_INCREMENT_SEC)
 
     # --- discover the fixed node set from the FIRST record ---
     try:

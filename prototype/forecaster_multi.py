@@ -15,8 +15,8 @@ from itertools import islice
 import json  # for emitting forecast JSON
 
 from forecaster_single import (
-    read_json_records, RollingBuffer, build_model, train_block,
-    extract_scaler_state, apply_scaler_state,
+    read_json_records, impute_missing_records, RollingBuffer, build_model,
+    train_block, extract_scaler_state, apply_scaler_state,
     assemble_input_vector, build_forecast_json,
     HIST, FUT, USE_CURRENT_PQ, TS_INCREMENT_SEC,
     DAY_LAG_SEC, WEEK_LAG_SEC, RETENTION_SEC,
@@ -104,23 +104,42 @@ def drain_all(q):
 # =====================================================
 def feeder_proc(train_data_q, fc_data_q, data_path):
     log = setup_logger("feeder", FEEDER_LOG)
-    log.info(f"FEEDER start | path={data_path} | rate={FEED_RATE_HZ} Hz")
+    log.info(f"FEEDER start | path={data_path} | rate={FEED_RATE_HZ} Hz "
+             f"| increment={TS_INCREMENT_SEC}s")
     interval = 1.0 / FEED_RATE_HZ if FEED_RATE_HZ > 0 else 0.0
-    n = 0
+
+    n_real = 0
+    n_imp = 0
     last_ts = None
-    for record in read_json_records(data_path):
-        train_data_q.put(record)   # trainer: keep-all FIFO
-        fc_data_q.put(record)      # forecaster: keep-all FIFO (drains internally)
-        n += 1
-        last_ts = int(record["timestamp"])
-        if n % 500 == 0:
-            log.info(f"fed {n} records | latest_ts={utc_str(last_ts)}")
-        if interval:
-            time.sleep(interval)
+
+    # Wrap the file source through the imputer so gaps are backfilled with
+    # grid-aligned, linearly-interpolated records. On a complete file this is
+    # a no-op (no bursts). Records carry "_imputed" True/False.
+    source = impute_missing_records(read_json_records(data_path), TS_INCREMENT_SEC)
+
+    for record in source:
+        # Emit to BOTH queues (trainer: keep-all; forecaster: keep-all).
+        # Imputed records in a burst go out back-to-back with no sleep; the
+        # sleep happens only on the trailing REAL record — mimicking the
+        # arrival cadence of actual state estimates on the bus.
+        train_data_q.put(record)
+        fc_data_q.put(record)
+
+        if record.get("_imputed", False):
+            n_imp += 1
+        else:
+            n_real += 1
+            last_ts = int(record["timestamp"])
+            if n_real % 500 == 0:
+                log.info(f"fed {n_real} real (+{n_imp} imputed) "
+                         f"| latest_ts={utc_str(last_ts)}")
+            if interval:
+                time.sleep(interval)   # pace only on real estimates
+
     train_data_q.put(DONE)
     fc_data_q.put(DONE)
-    log.info(f"FEEDER done | total={n} records | last_ts="
-             f"{utc_str(last_ts) if last_ts else 'n/a'} | sent DONE")
+    log.info(f"FEEDER done | total={n_real} real + {n_imp} imputed "
+             f"| last_ts={utc_str(last_ts) if last_ts else 'n/a'} | sent DONE")
 
 # =====================================================
 # TRAINER PROCESS  (STUB body)
@@ -383,16 +402,17 @@ def forecaster_proc(fc_data_q, model_q):
             data_done = True
 
         latest_ts = None
+        latest_imputed = False
         for record in records:
             if buf is None:
-                # lazy init from first record
+                # lazy init from first record (always REAL: no leading
+                # imputation is ever emitted, so the first record is real)
                 node_names = sorted(record["nodes"].keys())
                 buf = RollingBuffer(node_names)
                 model, *_ = build_model(buf.num_nodes)
                 store = NormStore(buf.num_nodes)
                 scalers = (buf.sc_V, buf.sc_ang, buf.sc_P, buf.sc_Q)
-                log.info(f"lazy-init | {buf.num_nodes} nodes | "
-                         f"first_ts={utc_str(int(record['timestamp']))}")
+                log.info(f"lazy-init | {buf.num_nodes} nodes | first_ts={utc_str(int(record['timestamp']))}")
                 if pending_snap is not None:
                     blob = torch.load(io.BytesIO(pending_snap["blob"]),
                                       map_location="cpu")
@@ -402,15 +422,21 @@ def forecaster_proc(fc_data_q, model_q):
                     current_version = pending_snap["version"]
                     log.info(f"applied held snapshot v{current_version}")
                     pending_snap = None
+            # Ingest EVERY record (imputed + real) to keep history gapless.
             ingest(record)
             latest_ts = int(record["timestamp"])
+            latest_imputed = bool(record.get("_imputed", False))   # NEW
 
-        # keep memory bounded
         if records:
             evict()
 
-        # 3) FORECAST the latest timestamp (only if we have a trained model).
-        if latest_ts is not None:
+        # 3) FORECAST the latest timestamp — but ONLY if it is a REAL estimate.
+        # Imputed (interpolated) data is ingested for gapless history but must
+        # not trigger a published forecast. Because the feeder emits each gap as
+        # a [imp, ..., real] burst, the latest drained record is normally real;
+        # if a drain lands mid-burst on an imputed record, we simply skip this
+        # cycle and forecast on the real record that arrives next cycle.
+        if latest_ts is not None and not latest_imputed:      # NEW: skip if imputed
             if have_scalers:
                 result = forecast_latest(model, store, buf, latest_ts, log)
                 if result is not None:
@@ -418,17 +444,14 @@ def forecaster_proc(fc_data_q, model_q):
                     fc_count += 1
                     fc_json = build_forecast_json(preds, nids, base_ts_arr, buf,
                                                   base_time=latest_ts)
-                    # emit JSON (this is the bus-publish unit). Log judiciously.
                     if fc_count == 1 or fc_count % FORECAST_LOG_EVERY == 0:
                         log.info(f"[FORECAST] #{fc_count} base_time={utc_str(latest_ts)} "
-                                 f"model v{current_version} | "
-                                 f"{len(fc_json['nodes'])} nodes")
-                        # full JSON only occasionally to keep the log readable
+                                 f"using model v{current_version} | {len(fc_json['nodes'])} nodes")
                         log.info(json.dumps(fc_json))
             else:
                 if not warmup_logged:
                     log.info(f"latest_ts={utc_str(latest_ts)} | no model yet "
-                             f"(warm-up) — ingesting only until first snapshot")
+                             f"(warm-up) — skipping forecasts until first snapshot")
                     warmup_logged = True
 
         # 4) shutdown when BOTH streams exhausted.
