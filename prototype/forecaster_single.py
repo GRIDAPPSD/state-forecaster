@@ -18,13 +18,14 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 # =====================================================
 # CONFIG  (explicit, not implicit — designed for configurability)
 # =====================================================
-JSON_PATH = "results_data_forecasting_13.json"
-#JSON_PATH = "results_data_forecasting_123.json"
+#JSON_PATH = "results_data_forecasting_13_real.json"
+JSON_PATH = "results_data_forecasting_13_5min_real.json"
+#JSON_PATH = "results_data_forecasting_123_real.json"
 #JSON_PATH = "gappy_13.json"
 
 # --- streaming cadence ---
-TS_INCREMENT_SEC = 60          # timestamp spacing in the input stream (1 min)
-#TS_INCREMENT_SEC = 300          # timestamp spacing in the input stream (5 min)
+#TS_INCREMENT_SEC = 60          # timestamp spacing in the input stream (1 min)
+TS_INCREMENT_SEC = 300          # timestamp spacing in the input stream (5 min)
 #TS_INCREMENT_SEC = 900          # timestamp spacing in the input stream (15 min)
 
 # --- history / horizon (in SAMPLES, i.e. timestamps) ---
@@ -94,21 +95,58 @@ INPUT_DIM = (
 )
 OUTPUT_DIM = FUT * 2
 
-# =====================================================
-# RECORD SOURCE (the streaming seam)
-# Today: read line-delimited JSON. Later: replaced by a multiprocessing.Queue
-# consumer fed by a separate feeder process. Downstream code only iterates it.
-# =====================================================
+def _pq_value(x):
+    """Coerce a P or Q field to float. The real State Estimator publishes the
+    string "NA" for buses without a P/Q estimate (e.g. SOURCEBUS); map those to
+    0.0 (matches the prior simplified-file handling). None is also treated as 0.0."""
+    if x == "NA" or x is None:
+        return 0.0
+    return float(x)
+
 def read_json_records(path):
-    """Yield one parsed record per line: {"timestamp": epoch_sec, "nodes": {...}}.
-    Angle values are already in RADIANS."""
+    """Yield one internal record per line, parsed from the GridAPPS-D State
+    Estimator publish format (SvEstVoltages).
+
+    Input line (real format):
+        {"SvEstVoltages": [{"ConnectivityNode": "632", "phase": "1",
+                             "P": .., "Q": .., "v": .., "angle": ..}, ...],
+         "timeStamp": 1700000000}
+
+    Yields internal record (unchanged downstream shape):
+        {"timestamp": 1700000000,
+         "nodes": {"632.1": {"P": .., "Q": .., "V": .., "Angle": ..}, ...}}
+
+    Notes:
+      * Internal node key = ConnectivityNode + "." + phase (e.g. "632" + "1"
+        -> "632.1"). This single combined key is the NN's node identity
+        (Approach 3: combined internally, split back to separate fields only
+        at output in build_forecast_json). Phase is used AS-IS (no mapping);
+        dots are only ever separators, never part of a ConnectivityNode value.
+      * v -> V, angle -> Angle (angle already in RADIANS; no unit conversion).
+      * P/Q == "NA" -> 0.0 (SOURCEBUS etc.). V and angle are NOT NA-coerced:
+        a missing voltage/angle should fail loudly rather than be silently
+        zeroed into the history window.
+      * variance fields (angleVariance, vVariance) are ignored.
+    """
     with open(path, "r") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            yield json.loads(line)
-
+            rec = json.loads(line)
+            ts = int(rec["timeStamp"])
+            nodes = {}
+            for entry in rec["SvEstVoltages"]:
+                cn = entry["ConnectivityNode"]
+                phase = entry["phase"]
+                node_key = f"{cn}.{phase}" if phase != "" else cn
+                nodes[node_key] = {
+                    "P": _pq_value(entry["P"]),
+                    "Q": _pq_value(entry["Q"]),
+                    "V": float(entry["v"]),
+                    "Angle": float(entry["angle"]),
+                }
+            yield {"timestamp": ts, "nodes": nodes}
 
 def impute_missing_records(source, increment_sec):
     """Wrap a record source to yield a gapless, grid-aligned stream.
@@ -576,9 +614,12 @@ def build_forecast_json(preds, nids, base_ts, buf, base_time=None):
     This is the output unit that will later be published to the GridAPPS-D bus
     (one structure per forecast actually run). Physical units; epoch seconds.
 
-    If base_time is None, uses the LATEST (max) scorable base timestamp present
-    — a stand-in for the current file-based code; in the live app the forecaster
-    runs on the most-recent incoming state estimate instead.
+    Node identity: internally the NN uses a single combined key (e.g. "632.1").
+    On output we split it back on the LAST dot into separate ConnectivityNode
+    ("632") and phase ("1") fields — matching the GridAPPS-D publish
+    convention. Phase is emitted AS-IS (no mapping); dots are only separators.
+
+    If base_time is None, uses the LATEST (max) scorable base timestamp present.
     """
     if base_time is None:
         base_time = int(base_ts.max())
@@ -591,10 +632,17 @@ def build_forecast_json(preds, nids, base_ts, buf, base_time=None):
 
     nodes_out = {}
     for row, nid in zip(sel_preds, sel_nids):
-        node_name = buf.id_to_node[int(nid)]
-        V_series = buf.sc_V.inverse(row[0::2])        # FUT voltage-magnitude (pu)
+        node_key = buf.id_to_node[int(nid)]
+        # split combined internal key -> ConnectivityNode + phase (last dot)
+        if "." in node_key:
+            cn, phase = node_key.rsplit(".", 1)
+        else:
+            cn, phase = node_key, ""
+        V_series = buf.sc_V.inverse(row[0::2])        # FUT voltage-magnitude
         ang_series = buf.sc_ang.inverse(row[1::2])    # FUT angle (rad)
-        nodes_out[node_name] = {
+        nodes_out[node_key] = {
+            "ConnectivityNode": cn,
+            "phase": phase,
             "V": [float(v) for v in V_series],
             "Angle": [float(a) for a in ang_series],
         }
