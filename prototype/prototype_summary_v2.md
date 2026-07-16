@@ -1,8 +1,3 @@
-Here's the refreshed, **fully self-contained** project summary. It does not depend on the earlier one — this plus the source files (`forecaster_single.py`, `forecaster_multi.py`, and the `util/` scripts) is everything a new chat or a colleague needs. Save it as e.g. `state_forecaster_project_summary_v2.md`.
-
-Given its length, I'm delivering it in two parts to avoid truncation — this is **Part 1 of 2** (Sections Part 2 (Sections 8–13) follows in my next message.
-
----
 
 # State Forecaster — Project State Summary (v2)
 
