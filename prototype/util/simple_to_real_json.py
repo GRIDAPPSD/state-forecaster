@@ -6,24 +6,23 @@ Convert the "simplified" state-estimate JSON Lines format into the "real"
 GridAPPS-D State Estimator publish format (SvEstVoltages), one JSON object
 per line (one per timestamp).
 
-FIRST-CUT SIMPLIFICATIONS (deliberate; see project notes):
-  * ConnectivityNode keeps the FULL simplified node name INCLUDING the phase
-    suffix (e.g. "632.1"), so it remains unique per entry on its own. The
-    forecaster (for now) uses this combined name as its single node key.
-    (In the true bus format ConnectivityNode is a phase-less CIM mRID shared
-    across up to 3 phase entries; we intentionally differ here.)
-  * A separate "phase" field is ALSO added (1->A, 2->B, 3->C), so phase info
-    is duplicated (inside ConnectivityNode and in phase). This carries the
-    phase forward for eventual GridAPPS-D consistency.
-  * NO unit conversion on angle. Values are passed through UNCHANGED (treated
-    as radians end-to-end). The real bus format publishes degrees, but per
-    project decision we keep radians here; this also makes the transform
-    lossless (a later new-format reader can reproduce byte-identical records).
+NODE / PHASE HANDLING:
+  * The simplified node key (e.g. "632.1") is split on its LAST dot into a
+    phase-less ConnectivityNode ("632") and a separate phase ("1").
+  * The phase is passed through AS-IS — NO number<->letter mapping. Whatever
+    the input uses ("1", "A", etc.) is emitted unchanged, so the phase we
+    publish is guaranteed identical to the phase we received. (Dots are only
+    ever separators, never part of a ConnectivityNode value.)
+
+OTHER NOTES:
+  * NO unit conversion on angle. Values pass through UNCHANGED (radians
+    end-to-end). This keeps the transform lossless: the forecaster's reader
+    recombines ConnectivityNode + "." + phase into the original internal key,
+    so forecasts remain byte-identical to the old simplified-file runs.
   * Variance fields (angleVariance, vVariance) are omitted (unused).
 
 Field mapping (per node entry):
-    simplified key "632.1"  -> ConnectivityNode "632.1"  (kept whole)
-                     suffix  -> phase  (1->A, 2->B, 3->C)
+    simplified key "632.1"  -> ConnectivityNode "632"  +  phase "1"
     P     -> P     (pass through)
     Q     -> Q     (pass through)
     V     -> v     (pass through; note lowercase key)
@@ -31,7 +30,7 @@ Field mapping (per node entry):
 
 Output record shape (one per line):
     {"SvEstVoltages": [
-        {"ConnectivityNode": "632.1", "phase": "A",
+        {"ConnectivityNode": "632", "phase": "1",
          "P": ..., "Q": ..., "v": ..., "angle": ...},
         ...
      ],
@@ -44,28 +43,17 @@ Usage:
 import sys
 import json
 
-# phase number (as string) -> phase letter
-PHASE_NUM_TO_LETTER = {"1": "A", "2": "B", "3": "C"}
-# defensive: also accept letter suffixes already in a/b/c form
-PHASE_LETTER_TO_LETTER = {"a": "A", "b": "B", "c": "C"}
 
-
-def derive_phase(node_key):
-    """Return the phase letter (A/B/C) parsed from a simplified node key's
-    suffix after the LAST dot. Returns "" (with a warning) if no dot or an
-    unrecognized suffix."""
+def split_node_key(node_key):
+    """Split a simplified node key into (ConnectivityNode, phase) on the LAST
+    dot. Phase is returned AS-IS (no mapping). If there is no dot, returns the
+    whole key as ConnectivityNode and "" as phase, with a warning."""
     if "." not in node_key:
-        print(f"[WARN] node key '{node_key}' has no '.' suffix; "
-              f"emitting empty phase.")
-        return ""
-    suffix = node_key.rsplit(".", 1)[1]
-    if suffix in PHASE_NUM_TO_LETTER:
-        return PHASE_NUM_TO_LETTER[suffix]
-    if suffix.lower() in PHASE_LETTER_TO_LETTER:
-        return PHASE_LETTER_TO_LETTER[suffix.lower()]
-    print(f"[WARN] node key '{node_key}' has unrecognized phase suffix "
-          f"'{suffix}'; emitting empty phase.")
-    return ""
+        print(f"[WARN] node key '{node_key}' has no '.' separator; "
+              f"emitting phase-less entry.")
+        return node_key, ""
+    cn, phase = node_key.rsplit(".", 1)
+    return cn, phase
 
 
 def convert(in_path, out_path):
@@ -73,6 +61,7 @@ def convert(in_path, out_path):
     n_entries = 0
     with open(in_path, "r") as fin, open(out_path, "w") as fout:
         for line in fin:
+            line = line.strip()
             if not line:
                 continue
             rec = json.loads(line)
@@ -81,14 +70,14 @@ def convert(in_path, out_path):
 
             sv_entries = []
             for node_key, vals in nodes.items():
-                phase = derive_phase(node_key)
+                cn, phase = split_node_key(node_key)
                 sv_entries.append({
-                    "ConnectivityNode": node_key,   # kept whole (incl. phase)
-                    "phase": phase,
+                    "ConnectivityNode": cn,       # phase-less
+                    "phase": phase,               # as-is, no mapping
                     "P": vals["P"],
                     "Q": vals["Q"],
-                    "v": vals["V"],                 # V -> v
-                    "angle": vals["Angle"],         # Angle -> angle (radians, unchanged)
+                    "v": vals["V"],               # V -> v
+                    "angle": vals["Angle"],       # Angle -> angle (radians, unchanged)
                 })
                 n_entries += 1
 
