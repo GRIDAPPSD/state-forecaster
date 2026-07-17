@@ -24,9 +24,10 @@ JSON_PATH = "results_data_forecasting_13_5min_real.json"
 #JSON_PATH = "gappy_13.json"
 
 # --- streaming cadence ---
-#TS_INCREMENT_SEC = 60          # timestamp spacing in the input stream (1 min)
+#TS_INCREMENT_SEC = 60           # timestamp spacing in the input stream (1 min)
 TS_INCREMENT_SEC = 300          # timestamp spacing in the input stream (5 min)
 #TS_INCREMENT_SEC = 900          # timestamp spacing in the input stream (15 min)
+CADENCE_CHECK_SAMPLES = 20      # real records to sample for the startup cadence check
 
 # --- history / horizon (in SAMPLES, i.e. timestamps) ---
 HIST = 15                      # past samples used as input (15 min @ 1-min)
@@ -148,53 +149,76 @@ def read_json_records(path):
                 }
             yield {"timestamp": ts, "nodes": nodes}
 
+def _emit_cadence_warning(min_delta, increment_sec):
+    """Loud, hard-to-miss warning when the detected data cadence doesn't match
+    the configured TS_INCREMENT_SEC. Printed once. Goes to stdout (thech
+    console in multi-process), so it surfaces prominently rather than being
+    buried."""
+    bar = "*" * 72
+    print("\n" + bar)
+    print("!!!!!!!!!!!!!!!!!!!!!!  CADENCE MISMATCH WARNING  !!!!!!!!!!!!!!!!!!!!!!")
+    print(bar)
+    print(f"***  CONFIGURED TS_INCREMENT_SEC         = {increment_sec} s")
+    print(f"***  DETECTED data cadence (min spacing) = {min_delta} s")
+    if min_delta > increment_sec:
+        print("***  >>> CONFIG INCREMENT IS TOO SMALL FOR THIS DATA <<<")
+        print("***  The imputer will FABRICATE interpolated records to fill")
+        print("***  gaps that do not really exist, yielding results that look")
+        print("***  PLAUSIBLE BUT ARE WRONG (and much slower training).")
+    else:
+        print("***  >>> CONFIG INCREMENT IS TOO LARGE FOR THIS DATA <<<")
+        print("***  History positions and lag lookups will be MISALIGNED.")
+    print(f"***  ACTION: set TS_INCREMENT_SEC = {min_delta} to match the data,")
+    print("***  or supply state estimates at the configured cadence.")
+    print(bar + "\n")
+
 def impute_missing_records(source, increment_sec):
-    """Wrap a record source to yield a gapless, grid-aligned stream.
-
-    Incoming record timestamps are assumed to be multiples of increment_sec
-    (grid-aligned). When two consecutive REAL records are more than one
-    increment apart, linearly-interpolated placeholder records are synthesized
-    for each missing grid-aligned timestamp and yielded IMMEDIATELY BEFORE the
-    real record that triggered them — i.e. a "burst": [imp, imp, ..., real].
-
-    Design points (see project discussion):
-      * NO leading imputation: nothing is emitted before the first real record.
-        The first real record is effectively "time zero" for forecasting.
-      * Imputation only happens once the FORWARD (later) real record is in hand,
-        so each imputed record is emitted in the same burst as its trigger.
-      * Each imputed record carries "_imputed": True; real records carry
-        "_imputed": False. Downstream code that only reads "timestamp"/"nodes"
-        is unaffected; the flag lets the forecaster skip forecasting on imputed
-        data while still ingesting it to keep history gapless.
-      * Interpolation is linear per node for P, Q, V, Angle. (Safe for angle
-        here because per-phase angles cluster near 0 / ±2.09 rad, far from the
-        ±pi wraparound.)
-    """
+    """Wrap a record source to yield a gapless, grid-aligned stream (see prior
+    docs). Also performs a one-time STARTUP CADENCE CHECK on the raw spacing of
+    the first real records, warning loudly (once) on a mismatch with
+    increment_sec. Minimum observed spacing = true data cadence (gaps only
+    increase spacing)."""
     prev_ts = None
     prev_nodes = None
+
+    # --- cadence-check state ---
+    cad_min_delta = None
+    cad_count = 0
+    cad_warned = False       # True once the cadence check has concluded (pass or fail)
+    cad_mismatch = False     # True if a mismatch was detected (suppresses gap-spam)
 
     for record in source:
         ts = int(record["timestamp"])
 
         if prev_ts is not None:
             delta = ts - prev_ts
+
+            # --- cadence check on raw spacing (before imputation) ---
+            if not cad_warned and delta > 0:
+                cad_min_delta = delta if cad_min_delta is None else min(cad_min_delta, delta)
+                cad_count += 1
+                # Conclude early if we already have definitive evidence, else at N samples.
+                #  * min_delta < increment  -> definitively "too large" (can't get smaller)
+                #  * reached sample budget   -> min_delta is the true cadence
+                if cad_min_delta < increment_sec or cad_count >= CADENCE_CHECK_SAMPLES:
+                    if cad_min_delta != increment_sec:
+                        _emit_cadence_warning(cad_min_delta, increment_sec)
+                        cad_mismatch = True
+                    cad_warned = True
+
             if delta <= 0:
-                # Non-increasing timestamp: unexpected. Pass through untouched;
-                # don't attempt imputation across a non-forward step.
                 print(f"[IMPUTE] WARNING: non-increasing timestamp "
                       f"{prev_ts} -> {ts}; passing through without imputation.")
             elif delta % increment_sec != 0:
-                # Not grid-aligned: violates the stated assumption. Don't
-                # fabricate misaligned rows; pass the real record through and
-                # log so it's visible.
-                print(f"[IMPUTE] WARNING: gap {delta}s not a multiple of "
-                      f"increment {increment_sec}s ({prev_ts} -> {ts}); "
-                      f"no imputation for this gap.")
+                # Suppress this per-gap spam once a cadence mismatch is known —
+                # the single banner already explains the root cause.
+                if not cad_mismatch:
+                    print(f"[IMPUTE] WARNING: gap {delta}s not a multiple of "
+                          f"increment {increment_sec}s ({prev_ts} -> {ts}); "
+                          f"no imputation for this gap.")
             else:
                 gap_steps = delta // increment_sec
                 if gap_steps > 1:
-                    # Synthesize gap_steps - 1 imputed records along the line
-                    # from prev_nodes -> record["nodes"].
                     for k in range(1, gap_steps):
                         frac = k / gap_steps
                         imp_ts = prev_ts + k * increment_sec
@@ -202,9 +226,6 @@ def impute_missing_records(source, increment_sec):
                         for node_name, cur_vals in record["nodes"].items():
                             prev_vals = prev_nodes.get(node_name)
                             if prev_vals is None:
-                                # Node absent in previous record (shouldn't
-                                # happen with fixed node set); fall back to
-                                # current values rather than crash.
                                 imp_nodes[node_name] = dict(cur_vals)
                             else:
                                 imp_nodes[node_name] = {
@@ -213,16 +234,18 @@ def impute_missing_records(source, increment_sec):
                                     "V": prev_vals["V"] + frac * (cur_vals["V"] - prev_vals["V"]),
                                     "Angle": prev_vals["Angle"] + frac * (cur_vals["Angle"] - prev_vals["Angle"]),
                                 }
-                        yield {"timestamp": imp_ts,
-                               "nodes": imp_nodes,
-                               "_imputed": True}
+                        yield {"timestamp": imp_ts, "nodes": imp_nodes, "_imputed": True}
 
-        # Emit the real record (tagged as non-imputed).
         record["_imputed"] = False
         yield record
 
         prev_ts = ts
         prev_nodes = record["nodes"]
+
+    # --- final cadence check for streams shorter than the sample budget ---
+    if not cad_warned and cad_min_delta is not None:
+        if cad_min_delta != increment_sec:
+            _emit_cadence_warning(cad_min_delta, increment_sec)
 
 # =====================================================
 # TIME FEATURES (from epoch seconds; no pandas)
