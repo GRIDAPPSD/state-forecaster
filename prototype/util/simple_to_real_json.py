@@ -23,15 +23,15 @@ OTHER NOTES:
 
 Field mapping (per node entry):
     simplified key "632.1"  -> ConnectivityNode "632"  +  phase "1"
-    P     -> P     (pass through)
-    Q     -> Q     (pass through)
-    V     -> v     (pass through; note lowercase key)
-    Angle -> angle (pass through, NO unit change; note lowercase key)
+    P     -> P        (pass through)
+    Q     -> Q        (pass through)
+    V     -> v        (pass through; note lowercase key)
+    Angle -> angleRad (pass through, NO unit change; note lowercase key)
 
 Output record shape (one per line):
     {"SvEstVoltages": [
         {"ConnectivityNode": "632", "phase": "1",
-         "P": ..., "Q": ..., "v": ..., "angle": ...},
+         "P": ..., "Q": ..., "v": ..., "angleRad": ...},
         ...
      ],
      "timeStamp": 1700000000}
@@ -77,7 +77,7 @@ def convert(in_path, out_path):
                     "P": vals["P"],
                     "Q": vals["Q"],
                     "v": vals["V"],               # V -> v
-                    "angle": vals["Angle"],       # Angle -> angle (radians, unchanged)
+                    "angleRad": vals["Angle"],    # Angle -> angleRad (radians, unchanged)
                 })
                 n_entries += 1
 
