@@ -714,7 +714,11 @@ def process_block(model, opt, sched, crit, amp, buf,
     val_idx = train_idx[:n_val]
     tr_idx = train_idx[n_val:]
     print(f"[TRAIN] Block {block_id} | train={len(tr_idx)} val={len(val_idx)}")
-    train_block(model, opt, sched, crit, amp, tr_idx, val_idx, buf, block_id)
+    if len(tr_idx) == 0:
+        print(f"  Block {block_id}: no training samples "
+              f"(insufficient data: need > HIST+FUT={HIST+FUT} timestamps) — skipping train.")
+    else:
+        train_block(model, opt, sched, crit, amp, tr_idx, val_idx, buf, block_id)
 
     # 5) evict rows older than the retention horizon
     buf.evict_old()
