@@ -123,7 +123,7 @@ def read_json_records(path):
         (Approach 3: combined internally, split back to separate fields only
         at output in build_forecast_json). Phase is used AS-IS (no mapping);
         dots are only ever separators, never part of a ConnectivityNode value.
-      * v -> V, angleRad -> Angle
+      * vpu -> V, angleRad -> Angle
       * P/Q == "NA" -> 0.0 (SOURCEBUS etc.). V and angle are NOT NA-coerced:
         a missing voltage/angle should fail loudly rather than be silently
         zeroed into the history window.
@@ -144,7 +144,7 @@ def read_json_records(path):
                 nodes[node_key] = {
                     "P": _pq_value(entry["P"]),
                     "Q": _pq_value(entry["Q"]),
-                    "V": float(entry["v"]),
+                    "V": float(entry["vpu"]),
                     "Angle": float(entry["angleRad"]),
                 }
             yield {"timestamp": ts, "nodes": nodes}
