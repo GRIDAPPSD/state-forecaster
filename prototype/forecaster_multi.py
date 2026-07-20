@@ -17,9 +17,9 @@ from itertools import islice
 import json  # for emitting forecast JSON
 
 from forecaster_single import (
-    read_json_records, impute_missing_records, RollingBuffer, build_model,
+    read_json_records, make_imputer, RollingBuffer, build_model,
     train_block, extract_scaler_state, apply_scaler_state,
-    assemble_input_vector, build_forecast_json,
+    assemble_input_vector, build_forecast_json, _pq_value,
     HIST, FUT, USE_CURRENT_PQ, TS_INCREMENT_SEC,
     DAY_LAG_SEC, WEEK_LAG_SEC, RETENTION_SEC,
     encode_phase, time_features, device,
@@ -99,95 +99,96 @@ def drain_all(q):
 
 # =====================================================
 # FEEDER PROCESS
-# Reads JSON one record at a time, paced by FEED_RATE_HZ.
-# Puts each record onto BOTH data queues:
-#   - trainer: keep-ALL FIFO       (plain put)
-#   - forecaster: keep-ALL FIFO    (plain put)
-# Sends DONE to both at EOF, then stops (no looping).
+# Source is either the GridAPPS-D bus (gappsd_simid set) or a file (simid None).
+# Both drivers funnel records through the shared per-record imputer step() and
+# a shared emit() that enqueues the resulting burst to BOTH data queues.
 # =====================================================
 def feeder_proc(train_data_q, fc_data_q, gappsd_simid, data_path):
-
-    # GDB 7/20/26: GridAPPS-D message callback for state estimates implemented
-    # as closure
-    def estimateCallback(header, message):
-        if 'processStatus' in message:
-            if message['processStatus'] == "COMPLETE":
-                log.info("Got processStatus COMPLETE message")
-                nonlocal keepLoopingFlag
-                keepLoopingFlag = False
-            return
-
-        msgdict = message['message']
-        ts = msgdict['timestamp']
-        log.info(f"Estimate for timestamp {ts}:")
-
-        estVolt = msgdict['Estimate']['SvEstVoltages']
-        log.info(json.dumps(estVolt))
-        return
-
-
     log = setup_logger("feeder", FEEDER_LOG)
 
-    # GDB 7/20/26: Support for GridAPPS-D simulations
+    # Per-record imputer step + cadence-guard (shared by whichever driver runs).
+    step = make_imputer(TS_INCREMENT_SEC)
+
+    # counters (shared)
+    n_real = 0
+    n_imp = 0
+    last_ts = None
+
+    def emit(record, pace=False):
+        """Run one record through the imputer and enqueue the resulting burst
+        (imputed records + the real one) onto both queues. Imputed records go
+        out back-to-back; optional pacing applies once, after the real record."""
+        nonlocal n_real, n_imp, last_ts
+        for out_rec in step(record):
+            train_data_q.put(out_rec)
+            fc_data_q.put(out_rec)
+            if out_rec.get("_imputed", False):
+                n_imp += 1
+            else:
+                n_real += 1
+                last_ts = int(out_rec["timestamp"])
+                if n_real % 500 == 0:
+                    log.info(f"fed {n_real} real (+{n_imp} imputed) "
+                             f"| latest_ts={utc_str(last_ts)}")
+        if pace and FEED_RATE_HZ > 0:
+            time.sleep(1.0 / FEED_RATE_HZ)   # pace only on real estimates (file driver)
+
+    # ---------- BUS DRIVER (GridAPPS-D) ----------
     if gappsd_simid is not None:
-        # import only when connecting with GridAPPS-D
         from gridappsd import GridAPPSD
         from gridappsd.topics import service_output_topic
 
-        # authentication details for GridAPPS-D platform
         os.environ['GRIDAPPSD_APPLICATION_ID'] = 'state-forecaster'
         os.environ['GRIDAPPSD_APPLICATION_STATUS'] = 'STARTED'
         os.environ['GRIDAPPSD_USER'] = 'app_user'
         os.environ['GRIDAPPSD_PASSWORD'] = '1234App'
 
-        # establish connection to GridAPPS-D platform
+        keepLoopingFlag = True
+
+        def estimateCallback(header, message):
+            nonlocal keepLoopingFlag
+            if 'processStatus' in message:
+                if message['processStatus'] == "COMPLETE":
+                    log.info("Got processStatus COMPLETE message")
+                    keepLoopingFlag = False
+                return
+            # unwrap: message -> message -> Estimate -> SvEstVoltages
+            msgdict = message['message']
+            ts = int(msgdict['timestamp'])
+            sv = msgdict['Estimate']['SvEstVoltages']
+            # build internal record: {"timestamp", "nodes": {key: {P,Q,V,Angle}}}
+            nodes = {}
+            for entry in sv:
+                node_key = f"{entry['ConnectivityNode']}.{entry['phase']}"
+                nodes[node_key] = {
+                    "P": _pq_value(entry["P"]),
+                    "Q": _pq_value(entry["Q"]),
+                    "V": float(entry["vpu"]),
+                    "Angle": float(entry["angleRad"]),
+                }
+            emit({"timestamp": ts, "nodes": nodes})   # no pacing on bus
+
         gapps = GridAPPSD(gappsd_simid)
         assert gapps.connected
-
         gapps.subscribe(service_output_topic('state-estimator', gappsd_simid),
                         estimateCallback)
+        log.info(f"FEEDER start | GridAPPS-D simid={gappsd_simid} "
+                 f"| increment={TS_INCREMENT_SEC}s")
 
-        keepLoopingFlag = True
         while keepLoopingFlag:
             time.sleep(FEEDER_POLL_SEC)
 
         train_data_q.put(DONE)
         fc_data_q.put(DONE)
-        log.info(f"FEEDER done | sent DONE")
+        log.info(f"FEEDER done | total={n_real} real + {n_imp} imputed "
+                 f"| last_ts={utc_str(last_ts) if last_ts else 'n/a'} | sent DONE")
         return
 
-
+    # ---------- FILE DRIVER ----------
     log.info(f"FEEDER start | path={data_path} | rate={FEED_RATE_HZ} Hz "
              f"| increment={TS_INCREMENT_SEC}s")
-    interval = 1.0 / FEED_RATE_HZ if FEED_RATE_HZ > 0 else 0.0
-
-    n_real = 0
-    n_imp = 0
-    last_ts = None
-
-    # Wrap the file source through the imputer so gaps are backfilled with
-    # grid-aligned, linearly-interpolated records. On a complete file this is
-    # a no-op (no bursts). Records carry "_imputed" True/False.
-    source = impute_missing_records(read_json_records(data_path), TS_INCREMENT_SEC)
-
-    for record in source:
-        # Emit to BOTH queues (trainer: keep-all; forecaster: keep-all).
-        # Imputed records in a burst go out back-to-back with no sleep; the
-        # sleep happens only on the trailing REAL record — mimicking the
-        # arrival cadence of actual state estimates on the bus.
-        train_data_q.put(record)
-        fc_data_q.put(record)
-
-        if record.get("_imputed", False):
-            n_imp += 1
-        else:
-            n_real += 1
-            last_ts = int(record["timestamp"])
-            if n_real % 500 == 0:
-                log.info(f"fed {n_real} real (+{n_imp} imputed) "
-                         f"| latest_ts={utc_str(last_ts)}")
-            if interval:
-                time.sleep(interval)   # pace only on real estimates
+    for record in read_json_records(data_path):
+        emit(record, pace=True)
 
     train_data_q.put(DONE)
     fc_data_q.put(DONE)

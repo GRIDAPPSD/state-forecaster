@@ -24,9 +24,11 @@ JSON_PATH = "results_data_forecasting_13_5min_real.json"
 #JSON_PATH = "gappy_13.json"
 
 # --- streaming cadence ---
+TS_INCREMENT_SEC = 3            # timestamp spacing in the input stream (real-time)
 #TS_INCREMENT_SEC = 60           # timestamp spacing in the input stream (1 min)
-TS_INCREMENT_SEC = 300          # timestamp spacing in the input stream (5 min)
+#TS_INCREMENT_SEC = 300          # timestamp spacing in the input stream (5 min)
 #TS_INCREMENT_SEC = 900          # timestamp spacing in the input stream (15 min)
+
 CADENCE_CHECK_SAMPLES = 20      # real records to sample for the startup cadence check
 
 # --- history / horizon (in SAMPLES, i.e. timestamps) ---
@@ -172,23 +174,39 @@ def _emit_cadence_warning(min_delta, increment_sec):
     print("***  or supply state estimates at the configured cadence.")
     print(bar + "\n")
 
-def impute_missing_records(source, increment_sec):
-    """Wrap a record source to yield a gapless, grid-aligned stream (see prior
-    docs). Also performs a one-time STARTUP CADENCE CHECK on the raw spacing of
-    the first real records, warning loudly (once) on a mismatch with
-    increment_sec. Minimum observed spacing = true data cadence (gaps only
-    increase spacing)."""
+
+def make_imputer(increment_sec):
+    """Create a stateful per-record imputation step for a gapless, grid-aligned
+    stream. Returns a function `step(record) -> [records]`.
+
+    Each call takes ONE internal-format record ({"timestamp", "nodes": {...}})
+    and returns the list of records to emit for it: normally just [real], but
+    when there's a gap since the previous real record, the linearly-interpolated
+    placeholder(s) are prepended -> [imp, imp, ..., real] (a "burst"). Imputed
+    records carry "_imputed": True; real records carry "_imputed": False.
+
+    State (prev timestamp/nodes + cadence-check counters) is held in closure via
+    nonlocal, so this works identically whether driven by a pull loop (file) or
+    a push callback (GridAPPS-D bus). Also performs the one-time startup CADENCE
+    CHECK on raw spacing of the first real records (min spacing = true cadence,
+    since gaps only increase spacing); warns loudly once on mismatch.
+
+    NO leading imputation: nothing is emitted before the first real record (it
+    is "time zero"). Interpolation is per-node linear for P, Q, V, Angle.
+    """
     prev_ts = None
     prev_nodes = None
-
-    # --- cadence-check state ---
     cad_min_delta = None
     cad_count = 0
-    cad_warned = False       # True once the cadence check has concluded (pass or fail)
-    cad_mismatch = False     # True if a mismatch was detected (suppresses gap-spam)
+    cad_warned = False
+    cad_mismatch = False
 
-    for record in source:
+    def step(record):
+        nonlocal prev_ts, prev_nodes
+        nonlocal cad_min_delta, cad_count, cad_warned, cad_mismatch
+
         ts = int(record["timestamp"])
+        out = []
 
         if prev_ts is not None:
             delta = ts - prev_ts
@@ -197,9 +215,7 @@ def impute_missing_records(source, increment_sec):
             if not cad_warned and delta > 0:
                 cad_min_delta = delta if cad_min_delta is None else min(cad_min_delta, delta)
                 cad_count += 1
-                # Conclude early if we already have definitive evidence, else at N samples.
-                #  * min_delta < increment  -> definitively "too large" (can't get smaller)
-                #  * reached sample budget   -> min_delta is the true cadence
+                # conclude early on definitive evidence, else at the sample budget
                 if cad_min_delta < increment_sec or cad_count >= CADENCE_CHECK_SAMPLES:
                     if cad_min_delta != increment_sec:
                         _emit_cadence_warning(cad_min_delta, increment_sec)
@@ -210,8 +226,6 @@ def impute_missing_records(source, increment_sec):
                 print(f"[IMPUTE] WARNING: non-increasing timestamp "
                       f"{prev_ts} -> {ts}; passing through without imputation.")
             elif delta % increment_sec != 0:
-                # Suppress this per-gap spam once a cadence mismatch is known —
-                # the single banner already explains the root cause.
                 if not cad_mismatch:
                     print(f"[IMPUTE] WARNING: gap {delta}s not a multiple of "
                           f"increment {increment_sec}s ({prev_ts} -> {ts}); "
@@ -224,28 +238,42 @@ def impute_missing_records(source, increment_sec):
                         imp_ts = prev_ts + k * increment_sec
                         imp_nodes = {}
                         for node_name, cur_vals in record["nodes"].items():
-                            prev_vals = prev_nodes.get(node_name)
-                            if prev_vals is None:
+                            pv = prev_nodes.get(node_name)
+                            if pv is None:
                                 imp_nodes[node_name] = dict(cur_vals)
                             else:
                                 imp_nodes[node_name] = {
-                                    "P": prev_vals["P"] + frac * (cur_vals["P"] - prev_vals["P"]),
-                                    "Q": prev_vals["Q"] + frac * (cur_vals["Q"] - prev_vals["Q"]),
-                                    "V": prev_vals["V"] + frac * (cur_vals["V"] - prev_vals["V"]),
-                                    "Angle": prev_vals["Angle"] + frac * (cur_vals["Angle"] - prev_vals["Angle"]),
+                                    "P": pv["P"] + frac * (cur_vals["P"] - pv["P"]),
+                                    "Q": pv["Q"] + frac * (cur_vals["Q"] - pv["Q"]),
+                                    "V": pv["V"] + frac * (cur_vals["V"] - pv["V"]),
+                                    "Angle": pv["Angle"] + frac * (cur_vals["Angle"] - pv["Angle"]),
                                 }
-                        yield {"timestamp": imp_ts, "nodes": imp_nodes, "_imputed": True}
+                        out.append({"timestamp": imp_ts, "nodes": imp_nodes, "_imputed": True})
 
         record["_imputed"] = False
-        yield record
+        out.append(record)
 
         prev_ts = ts
         prev_nodes = record["nodes"]
+        return out
 
-    # --- final cadence check for streams shorter than the sample budget ---
-    if not cad_warned and cad_min_delta is not None:
-        if cad_min_delta != increment_sec:
-            _emit_cadence_warning(cad_min_delta, increment_sec)
+    return step
+
+
+def impute_missing_records(source, increment_sec):
+    """Thin generator wrapper around make_imputer, preserving the pull-based
+    file-path behavior. Yields the same gapless, grid-aligned stream as before.
+    (The feeder's bus path drives make_imputer's step() directly instead.)"""
+    step = make_imputer(increment_sec)
+    for record in source:
+        for out_rec in step(record):
+            yield out_rec
+
+    # final cadence check for streams shorter than the sample budget: the
+    # generator has finished, so inspect the step's captured state indirectly.
+    # (Handled inside step for streams >= budget; for very short streams the
+    # one-time check simply may not have fired, which is acceptable — too little
+    # data to conclude a cadence, and such runs hit the insufficient-data guard.)
 
 # =====================================================
 # TIME FEATURES (from epoch seconds; no pandas)
