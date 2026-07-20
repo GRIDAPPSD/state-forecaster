@@ -212,6 +212,7 @@ def snapshot_to_bytes(model, buf, version):
                 "scaler_state": extract_scaler_state(buf)}, buf_io)
     return {"version": version, "blob": buf_io.getvalue()}
 
+
 def trainer_train_block(buf, model, optimizer, scheduler, criterion, scaler_amp,
                         block_start, block_end, block_id, version, model_q, log):
     """Real per-block training (mirrors Step B process_block, sans forecast)."""
@@ -397,11 +398,29 @@ def forecast_latest(model, store, buf, latest_ts, log):
     return preds, nids, base_ts_arr
 
 
-def forecaster_proc(fc_data_q, model_q):
+def forecaster_proc(fc_data_q, model_q, gappsd_simid):
     log = setup_logger("forecaster", FORECASTER_LOG)
     log.info("FORECASTER start")
 
-    buf = None            # RollingBuffer (raw history + scalers + phase)
+    # GridAPPS-D connection for PUBLISHING forecasts (no subscription here —
+    # the forecaster only produces output). Created INSIDE this child process
+    # (spawn) since connection objects don't pickle across the process boundary.
+    # `gapps` stays None for file-based runs (gappsd_simid is None).
+    gapps = None
+    if gappsd_simid is not None:
+        from gridappsd import GridAPPSD
+        from gridappsd.topics import service_output_topic
+        os.environ['GRIDAPPSD_APPLICATION_ID'] = 'state-forecaster'
+        os.environ['GRIDAPPSD_APPLICATION_STATUS'] = 'STARTED'
+        os.environ['GRIDAPPSD_USER'] = 'app_user'
+        os.environ['GRIDAPPSD_PASSWORD'] = '1234App'
+        gapps = GridAPPSD(gappsd_simid)
+        assert gapps.connected
+        log.info(f"FORECASTER connected to GridAPPS-D simid={gappsd_simid} "
+                 f"for publishing forecasts")
+        publish_to_topic = service_output_topic('state-forecaster', gappsd_simid)
+
+    buf = None
     model = None
     store = None          # NormStore (incremental normalized rows)
     scalers = None        # (sc_V, sc_ang, sc_P, sc_Q) — refs into buf's scalers
@@ -498,11 +517,17 @@ def forecaster_proc(fc_data_q, model_q):
                     preds, nids, base_ts_arr = result
                     fc_count += 1
                     fc_json = build_forecast_json(preds, nids, base_ts_arr, buf,
-                                                  base_time=latest_ts)
+                                                  base_time=latest_ts,
+                                                  simulation_id=gappsd_simid)
+
+                    if gapps is not None:
+                        gapps.send(publish_to_topic, json.dumps(fc_json))
+
                     if fc_count == 1 or fc_count % FORECAST_LOG_EVERY == 0:
                         log.info(f"[FORECAST] #{fc_count} base_time={utc_str(latest_ts)} "
                                  f"using model v{current_version} | {len(fc_json['nodes'])} nodes")
                         log.info(json.dumps(fc_json))
+
             else:
                 if not warmup_logged:
                     log.info(f"latest_ts={utc_str(latest_ts)} | no model yet "
@@ -549,7 +574,7 @@ def main():
                    args=(train_data_q, model_q),
                    name="trainer"),
         mp.Process(target=forecaster_proc,
-                   args=(fc_data_q, model_q),
+                   args=(fc_data_q, model_q, gappsd_simid),
                    name="forecaster"),
     ]
 

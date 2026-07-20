@@ -660,7 +660,7 @@ def forecast(model, forecast_indices, buf):
     base_ts = np.concatenate(base_ts)
     return preds, trues, nids, base_ts
 
-def build_forecast_json(preds, nids, base_ts, buf, base_time=None):
+def build_forecast_json(preds, nids, base_ts, buf, base_time=None, simulation_id=None):
     """Assemble the per-node forecast JSON for ONE base timestamp.
     This is the output unit that will later be published to the GridAPPS-D bus
     (one structure per forecast actually run). Physical units; epoch seconds.
@@ -676,7 +676,7 @@ def build_forecast_json(preds, nids, base_ts, buf, base_time=None):
         base_time = int(base_ts.max())
 
     row_mask = (base_ts == base_time)
-    sel_preds = preds[row_mask]          # [num_nodes_at_this_base, FUT*2]
+    sel_preds = preds[row_mask]
     sel_nids = nids[row_mask]
 
     forecast_times = [int(base_time + TS_INCREMENT_SEC * (k + 1)) for k in range(FUT)]
@@ -684,13 +684,12 @@ def build_forecast_json(preds, nids, base_ts, buf, base_time=None):
     nodes_out = {}
     for row, nid in zip(sel_preds, sel_nids):
         node_key = buf.id_to_node[int(nid)]
-        # split combined internal key -> ConnectivityNode + phase (last dot)
         if "." in node_key:
             cn, phase = node_key.rsplit(".", 1)
         else:
             cn, phase = node_key, ""
-        V_series = buf.sc_V.inverse(row[0::2])        # FUT voltage-magnitude
-        ang_series = buf.sc_ang.inverse(row[1::2])    # FUT angle (rad)
+        V_series = buf.sc_V.inverse(row[0::2])
+        ang_series = buf.sc_ang.inverse(row[1::2])
         nodes_out[node_key] = {
             "ConnectivityNode": cn,
             "phase": phase,
@@ -699,12 +698,14 @@ def build_forecast_json(preds, nids, base_ts, buf, base_time=None):
         }
 
     return {
-        "base_time": int(base_time),
+        "timestamp": int(base_time),
+        "simulation_id": simulation_id,
         "step_sec": TS_INCREMENT_SEC,
         "horizon": FUT,
         "forecast_times": forecast_times,
         "nodes": nodes_out,
     }
+
 
 def report_forecast(preds, trues, buf, label):
     print(f"\n====== FORECAST RESULTS [{label}] (Normalized) ======")
