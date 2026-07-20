@@ -6,6 +6,8 @@
 # model-snapshot handoff, model-queue-first priority, DONE shutdown,
 # per-process log files. NO real training/forecasting yet (Pieces 2 & 3).
 # =====================================================
+import sys
+import os
 import io
 import time
 import queue
@@ -33,7 +35,8 @@ import torch.multiprocessing as mp
 #FEED_RATE_HZ = 1.0          # records/sec the feeder emits (real ~1; >1 speeds testing)
 #FEED_RATE_HZ = 4.0          # records/sec the feeder emits (real ~1; >1 speeds testing)
 FEED_RATE_HZ = 20.0          # records/sec the feeder emits (real ~1; >1 speeds testing)
-FORECASTER_POLL_SEC = 0.05  # forecaster idle poll interval when no work is pending
+FORECASTER_POLL_SEC = 0.05   # forecaster idle poll interval when no work is pending
+FEEDER_POLL_SEC = 0.05       # feeder idle poll interval
 LOG_DIR = "."
 TRAINER_LOG = f"{LOG_DIR}/trainer.log"
 FORECASTER_LOG = f"{LOG_DIR}/forecaster.log"
@@ -102,8 +105,58 @@ def drain_all(q):
 #   - forecaster: keep-ALL FIFO    (plain put)
 # Sends DONE to both at EOF, then stops (no looping).
 # =====================================================
-def feeder_proc(train_data_q, fc_data_q, data_path):
+def feeder_proc(train_data_q, fc_data_q, gappsd_simid, data_path):
+
+    # GDB 7/20/26: GridAPPS-D message callback for state estimates implemented
+    # as closure
+    def estimateCallback(header, message):
+        if 'processStatus' in message:
+            if message['processStatus'] == "COMPLETE":
+                log.info("Got processStatus COMPLETE message")
+                nonlocal keepLoopingFlag
+                keepLoopingFlag = False
+            return
+
+        msgdict = message['message']
+        ts = msgdict['timestamp']
+        log.info(f"Estimate for timestamp {ts}:")
+
+        estVolt = msgdict['Estimate']['SvEstVoltages']
+        log.info(json.dumps(estVolt))
+        return
+
+
     log = setup_logger("feeder", FEEDER_LOG)
+
+    # GDB 7/20/26: Support for GridAPPS-D simulations
+    if gappsd_simid is not None:
+        # import only when connecting with GridAPPS-D
+        from gridappsd import GridAPPSD
+        from gridappsd.topics import service_output_topic
+
+        # authentication details for GridAPPS-D platform
+        os.environ['GRIDAPPSD_APPLICATION_ID'] = 'state-forecaster'
+        os.environ['GRIDAPPSD_APPLICATION_STATUS'] = 'STARTED'
+        os.environ['GRIDAPPSD_USER'] = 'app_user'
+        os.environ['GRIDAPPSD_PASSWORD'] = '1234App'
+
+        # establish connection to GridAPPS-D platform
+        gapps = GridAPPSD(gappsd_simid)
+        assert gapps.connected
+
+        gapps.subscribe(service_output_topic('state-estimator', gappsd_simid),
+                        estimateCallback)
+
+        keepLoopingFlag = True
+        while keepLoopingFlag:
+            time.sleep(FEEDER_POLL_SEC)
+
+        train_data_q.put(DONE)
+        fc_data_q.put(DONE)
+        log.info(f"FEEDER done | sent DONE")
+        return
+
+
     log.info(f"FEEDER start | path={data_path} | rate={FEED_RATE_HZ} Hz "
              f"| increment={TS_INCREMENT_SEC}s")
     interval = 1.0 / FEED_RATE_HZ if FEED_RATE_HZ > 0 else 0.0
@@ -140,6 +193,7 @@ def feeder_proc(train_data_q, fc_data_q, data_path):
     fc_data_q.put(DONE)
     log.info(f"FEEDER done | total={n_real} real + {n_imp} imputed "
              f"| last_ts={utc_str(last_ts) if last_ts else 'n/a'} | sent DONE")
+
 
 # =====================================================
 # TRAINER PROCESS  (STUB body)
@@ -469,6 +523,11 @@ def forecaster_proc(fc_data_q, model_q):
 # MAIN — spawn the three processes, wire the queues.
 # =====================================================
 def main():
+    # GDB 7/20/26: GriAPPS-D simulation ID is first command line argument
+    gappsd_simid = None
+    if len(sys.argv) > 1:
+      gappsd_simid = sys.argv[1]
+
     mp.set_start_method("spawn", force=True)  # required for CUDA + multiprocessing
 
     # --- Queues ---
@@ -483,7 +542,7 @@ def main():
 
     procs = [
         mp.Process(target=feeder_proc,
-                   args=(train_data_q, fc_data_q, JSON_PATH),
+                   args=(train_data_q, fc_data_q, gappsd_simid, JSON_PATH),
                    name="feeder"),
         mp.Process(target=trainer_proc,
                    args=(train_data_q, model_q),
