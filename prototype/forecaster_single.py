@@ -698,12 +698,14 @@ def build_forecast_json(preds, nids, base_ts, buf, base_time=None, simulation_id
         }
 
     return {
-        "timestamp": int(base_time),
-        "simulation_id": simulation_id,
-        "step_sec": TS_INCREMENT_SEC,
-        "horizon": FUT,
-        "forecast_times": forecast_times,
-        "nodes": nodes_out,
+        "timestamp": int(base_time),     # top-level: generic ADMS field
+        "simulation_id": simulation_id,  # top-level: generic ADMS field
+        "Forecast": {                    # forecast-specific payload nested here
+            "step_sec": TS_INCREMENT_SEC,
+            "horizon": FUT,
+            "forecast_times": forecast_times,
+            "nodes": nodes_out,
+        },
     }
 
 
