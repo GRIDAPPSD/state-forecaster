@@ -127,7 +127,8 @@ def feeder_proc(train_data_q, fc_data_q, gappsd_simid, data_path):
             else:
                 n_real += 1
                 last_ts = int(out_rec["timestamp"])
-                if n_real % 500 == 0:
+                #if n_real % 500 == 0:
+                if n_real % 60 == 0:
                     log.info(f"fed {n_real} real (+{n_imp} imputed) "
                              f"| latest_ts={utc_str(last_ts)}")
         if pace and FEED_RATE_HZ > 0:
@@ -525,7 +526,7 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
 
                     if fc_count == 1 or fc_count % FORECAST_LOG_EVERY == 0:
                         log.info(f"[FORECAST] #{fc_count} base_time={utc_str(latest_ts)} "
-                                 f"using model v{current_version} | {len(fc_json['nodes'])} nodes")
+                                 f"using model v{current_version} | {len(fc_json['Forecast']['nodes'])} nodes")
                         log.info(json.dumps(fc_json))
 
             else:
