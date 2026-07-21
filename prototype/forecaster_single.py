@@ -29,6 +29,10 @@ TS_INCREMENT_SEC = 60           # timestamp spacing in the input stream (1 min)
 #TS_INCREMENT_SEC = 300          # timestamp spacing in the input stream (5 min)
 #TS_INCREMENT_SEC = 900          # timestamp spacing in the input stream (15 min)
 
+COMPUTE_LIVE_MAE = True   # deferred scoring: score one forecast per model version
+                          # against the actual estimates that later arrive. Off for
+                          # production-speed runs.
+
 CADENCE_CHECK_SAMPLES = 20      # real records to sample for the startup cadence check
 
 # --- history / horizon (in SAMPLES, i.e. timestamps) ---

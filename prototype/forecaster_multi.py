@@ -21,7 +21,7 @@ from forecaster_single import (
     train_block, extract_scaler_state, apply_scaler_state,
     assemble_input_vector, build_forecast_json, _pq_value,
     HIST, FUT, USE_CURRENT_PQ, TS_INCREMENT_SEC,
-    DAY_LAG_SEC, WEEK_LAG_SEC, RETENTION_SEC,
+    DAY_LAG_SEC, WEEK_LAG_SEC, RETENTION_SEC, COMPUTE_LIVE_MAE,
     encode_phase, time_features, device,
     JSON_PATH, BLOCK_SEC, VAL_FRACTION, utc_str,
 )
@@ -432,6 +432,38 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
     fc_count = 0
     warmup_logged = False
 
+    # --- deferred live MAE scoring state ---
+    score_armed = False        # arm on snapshot adoption
+    pending = None             # {"remaining": set(ts), "pred": {ts: {node: (V, Ang)}},
+                               #  "abs_v": [...], "abs_a": [...], "n": 0, "version": int}
+
+    def score_pending(record):
+        """Deferred MAE: if this real estimate's timestamp matches a pending
+        forecast step, accumulate abs error (nodes present in both)."""
+        nonlocal pending
+        if pending is None:
+            return
+        ts = int(record["timestamp"])
+        if ts not in pending["remaining"]:
+            return
+        pred_at = pending["pred"][ts]
+        for node, vals in record["nodes"].items():
+            p = pred_at.get(node)
+            if p is None:
+                continue                      # node not in forecast — skip (defensive)
+            pending["abs_v"] += abs(p[0] - vals["V"])
+            pending["abs_a"] += abs(p[1] - vals["Angle"])
+            pending["n"] += 1
+        pending["remaining"].discard(ts)
+        if not pending["remaining"]:          # all horizon steps collected
+            n = max(pending["n"], 1)
+            log.info(f"[MAE] v{pending['version']} base_time="
+                     f"{utc_str(pending['base_time'])} | "
+                     f"Voltage MAE (pu): {pending['abs_v']/n:.6f} | "
+                     f"Angle MAE (rad): {pending['abs_a']/n:.6f} "
+                     f"({pending['n']} node-steps)")
+            pending = None
+
     def ingest(record):
         """Append raw to buf; if scalers known, incrementally normalize into store."""
         ts = int(record["timestamp"])
@@ -467,6 +499,8 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
                 store.rebuild_from_raw(buf, scalers)   # full re-normalize (rare)
                 have_scalers = True
                 current_version = snap["version"]
+                if COMPUTE_LIVE_MAE:
+                    score_armed = True   # score the NEXT forecast made under this version
                 log.info(f"adopted snapshot v{current_version} "
                          f"→ scalers updated, store re-normalized "
                          f"({sum(len(store.rows[n]) for n in range(store.num_nodes))} rows)")
@@ -500,7 +534,9 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
             # Ingest EVERY record (imputed + real) to keep history gapless.
             ingest(record)
             latest_ts = int(record["timestamp"])
-            latest_imputed = bool(record.get("_imputed", False))   # NEW
+            latest_imputed = bool(record.get("_imputed", False))
+            if COMPUTE_LIVE_MAE and not latest_imputed:
+                score_pending(record)      # deferred MAE on real estimates only
 
         if records:
             evict()
@@ -528,6 +564,25 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
                         log.info(f"[FORECAST] #{fc_count} base_time={utc_str(latest_ts)} "
                                  f"using model v{current_version} | {len(fc_json['Forecast']['nodes'])} nodes")
                         log.info(json.dumps(fc_json))
+
+                    if COMPUTE_LIVE_MAE and score_armed:
+                        pred = {}
+                        for k in range(FUT):
+                            ft = fc_json["Forecast"]["forecast_times"][k]
+                            pred[ft] = {
+                                node: (nd["V"][k], nd["Angle"][k])
+                                for node, nd in fc_json["Forecast"]["nodes"].items()
+                            }
+                        pending = {
+                            "remaining": set(pred.keys()),
+                            "pred": pred,
+                            "abs_v": 0.0, "abs_a": 0.0, "n": 0,
+                            "version": current_version,
+                            "base_time": latest_ts,
+                        }
+                        score_armed = False
+                        log.info(f"[MAE] armed: scoring forecast v{current_version} "
+                                 f"base_time={utc_str(latest_ts)} over {FUT} steps")
 
             else:
                 if not warmup_logged:
