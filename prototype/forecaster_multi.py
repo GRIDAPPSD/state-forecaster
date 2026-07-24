@@ -560,10 +560,16 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
                     if gapps is not None:
                         gapps.send(publish_to_topic, json.dumps(fc_json))
 
+                    #if gappsd_simid is not None:
+                    #    gapps = GridAPPSD(gappsd_simid)
+                    #    assert gapps.connected
+                    #    gapps.send(publish_to_topic, json.dumps(fc_json))
+                    #    gapps.close()
+
                     if fc_count == 1 or fc_count % FORECAST_LOG_EVERY == 0:
                         log.info(f"[FORECAST] #{fc_count} base_time={utc_str(latest_ts)} "
                                  f"using model v{current_version} | {len(fc_json['Forecast']['nodes'])} nodes")
-                        log.info(json.dumps(fc_json))
+                        #log.info(json.dumps(fc_json))
 
                     if COMPUTE_LIVE_MAE and score_armed:
                         pred = {}
