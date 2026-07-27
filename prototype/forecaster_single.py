@@ -756,9 +756,10 @@ def process_block(model, opt, sched, crit, amp, buf,
                             label=f"Block {block_id} ({utc_str(block_start)})")
             # --- per-node forecast JSON for the latest scorable base timestamp ---
             fc_json = build_forecast_json(preds, nids, base_ts, buf)
-            print(f"\n------ FORECAST JSON (base_time={fc_json['base_time']} "
-                  f"= {utc_str(fc_json['base_time'])}, "
-                  f"{len(fc_json['nodes'])} nodes, horizon={fc_json['horizon']}) ------")
+            print(f"\n------ FORECAST JSON (timestamp={fc_json['timestamp']} "
+                  f"= {utc_str(fc_json['timestamp'])}, "
+                  f"{len(fc_json['Forecast']['nodes'])} nodes, "
+                  f"horizon={fc_json['Forecast']['horizon']}) ------")
             print(json.dumps(fc_json, indent=2))
 
     else:
