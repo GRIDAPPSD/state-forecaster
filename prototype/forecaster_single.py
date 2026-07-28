@@ -18,10 +18,10 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 # =====================================================
 # CONFIG  (explicit, not implicit — designed for configurability)
 # =====================================================
-JSON_PATH = "results_data_forecasting_13_real.json"
-#JSON_PATH = "results_data_forecasting_13_5min_real.json"
-#JSON_PATH = "results_data_forecasting_123_real.json"
-#JSON_PATH = "gappy_13.json"
+JSON_PATH = "results_data_forecasting_13.json"
+#JSON_PATH = "results_data_forecasting_13_5min.json"
+#JSON_PATH = "results_data_forecasting_13_15min.json"
+#JSON_PATH = "results_data_forecasting_123.json"
 
 # --- streaming cadence ---
 #TS_INCREMENT_SEC = 3            # timestamp spacing in the input stream (real-time)
