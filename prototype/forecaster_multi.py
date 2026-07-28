@@ -603,9 +603,10 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
             log.info(f"FORECASTER received DONE on both queues → exit "
                      f"(total forecasts: {fc_count}, final model v{current_version})")
 
-            done_json = {"simulation_id": gappsd_simid,
-                         "processStatus": "COMPLETE"}
-            gapps.send(publish_to_topic, json.dumps(done_json))
+            if gapps is not None:
+                done_json = {"simulation_id": gappsd_simid,
+                             "processStatus": "COMPLETE"}
+                gapps.send(publish_to_topic, json.dumps(done_json))
 
             fc_data_q.cancel_join_thread()
             model_q.cancel_join_thread()
