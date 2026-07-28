@@ -18,6 +18,9 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 # =====================================================
 # CONFIG  (explicit, not implicit — designed for configurability)
 # =====================================================
+
+FORECAST_OUTPUT_JSONL = "forecast_output.jsonl"
+
 #JSON_PATH = "results_data_forecasting_13_1min.jsonl"
 JSON_PATH = "results_data_forecasting_13_5min.jsonl"
 #JSON_PATH = "results_data_forecasting_13_15min.jsonl"

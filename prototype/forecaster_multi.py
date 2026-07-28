@@ -23,7 +23,7 @@ from forecaster_single import (
     HIST, FUT, USE_CURRENT_PQ, TS_INCREMENT_SEC,
     DAY_LAG_SEC, WEEK_LAG_SEC, RETENTION_SEC, COMPUTE_LIVE_MAE,
     encode_phase, time_features, device,
-    JSON_PATH, BLOCK_SEC, VAL_FRACTION, utc_str,
+    FORECAST_OUTPUT_JSONL, JSON_PATH, BLOCK_SEC, VAL_FRACTION, utc_str,
 )
 import numpy as np
 import torch
@@ -445,6 +445,16 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
     pending = None             # {"remaining": set(ts), "pred": {ts: {node: (V, Ang)}},
                                #  "abs_v": [...], "abs_a": [...], "n": 0, "version": int}
 
+    # Forecast-output file: truncate any existing file at startup, then append
+    # one JSON line per published forecast (open/append/close per write --
+    # durable and handle held across the run). None disables it.
+    # Opened once here, written per forecast, closed at exit
+    if FORECAST_OUTPUT_JSONL:
+        with open(FORECAST_OUTPUT_JSONL, "w"):
+            pass # create/truncate to empty
+        log.info(f"Writing published forecasts to {FORECAST_OUTPUT_JSONL}")
+
+
     def score_pending(record):
         """Deferred MAE: if this real estimate's timestamp matches a pending
         forecast step, accumulate abs error (nodes present in both)."""
@@ -567,6 +577,9 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
 
                     if gapps is not None:
                         gapps.send(publish_to_topic, json.dumps(fc_json))
+                    if FORECAST_OUTPUT_JSONL:
+                        with open(FORECAST_OUTPUT_JSONL, "a") as f:
+                            f.write(json.dumps(fc_json) + "\n")
 
                     if fc_count == 1 or fc_count % FORECAST_LOG_EVERY == 0:
                         log.info(f"[FORECAST] #{fc_count} base_time={utc_str(latest_ts)} "
