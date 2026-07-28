@@ -18,15 +18,15 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 # =====================================================
 # CONFIG  (explicit, not implicit — designed for configurability)
 # =====================================================
-JSON_PATH = "results_data_forecasting_13.jsonl"
-#JSON_PATH = "results_data_forecasting_13_5min.jsonl"
+#JSON_PATH = "results_data_forecasting_13_1min.jsonl"
+JSON_PATH = "results_data_forecasting_13_5min.jsonl"
 #JSON_PATH = "results_data_forecasting_13_15min.jsonl"
-#JSON_PATH = "results_data_forecasting_123.jsonl"
+#JSON_PATH = "results_data_forecasting_123_5min.jsonl"
 
 # --- streaming cadence ---
 #TS_INCREMENT_SEC = 3            # timestamp spacing in the input stream (real-time)
-TS_INCREMENT_SEC = 60           # timestamp spacing in the input stream (1 min)
-#TS_INCREMENT_SEC = 300          # timestamp spacing in the input stream (5 min)
+#TS_INCREMENT_SEC = 60           # timestamp spacing in the input stream (1 min)
+TS_INCREMENT_SEC = 300          # timestamp spacing in the input stream (5 min)
 #TS_INCREMENT_SEC = 900          # timestamp spacing in the input stream (15 min)
 
 COMPUTE_LIVE_MAE = True   # deferred scoring: score one forecast per model version
