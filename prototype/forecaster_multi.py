@@ -103,7 +103,7 @@ def drain_all(q):
 # Both drivers funnel records through the shared per-record imputer step() and
 # a shared emit() that enqueues the resulting burst to BOTH data queues.
 # =====================================================
-def feeder_proc(train_data_q, fc_data_q, gappsd_simid, data_path):
+def feeder_proc(train_data_q, fc_data_q, sim_done, gappsd_simid, data_path):
     log = setup_logger("feeder", FEEDER_LOG)
 
     # Per-record imputer step + cadence-guard (shared by whichever driver runs).
@@ -179,8 +179,11 @@ def feeder_proc(train_data_q, fc_data_q, gappsd_simid, data_path):
         while keepLoopingFlag:
             time.sleep(FEEDER_POLL_SEC)
 
+        sim_done.set()
         train_data_q.put(DONE)
         fc_data_q.put(DONE)
+        train_data_q.cancel_join_thread()
+        fc_data_q.cancel_join_thread()
         log.info(f"FEEDER done | total={n_real} real + {n_imp} imputed "
                  f"| last_ts={utc_str(last_ts) if last_ts else 'n/a'} | sent DONE")
         return
@@ -242,7 +245,7 @@ def trainer_train_block(buf, model, optimizer, scheduler, criterion, scaler_amp,
     buf.evict_old()
 
 
-def trainer_proc(train_data_q, model_q):
+def trainer_proc(train_data_q, model_q, sim_done):
     log = setup_logger("trainer", TRAINER_LOG)
     log.info("TRAINER start")
     buf = None
@@ -253,19 +256,17 @@ def trainer_proc(train_data_q, model_q):
     version = 0
 
     while True:
+        if sim_done.is_set():
+            model_q.put(DONE)
+            log.info("TRAINER received DONE event → sent DONE to model queue → exit")
+            return
+
         item = train_data_q.get()  # blocking; keep-all FIFO
         if isinstance(item, str) and item == DONE:
-            # finalize trailing block if it holds data
-            if (buf is not None and buf.newest_ts is not None
-                    and buf.newest_ts >= block_start):
-                block_id += 1
-                version += 1
-                log.info(f"finalizing trailing block {block_id} on DONE")
-                trainer_train_block(buf, model, optimizer, scheduler, criterion,
-                                    scaler_amp, block_start, block_end, block_id,
-                                    version, model_q, log)
             model_q.put(DONE)
-            log.info("TRAINER received DONE → sent DONE to model queue → exit")
+            train_data_q.cancel_join_thread()
+            model_q.cancel_join_thread()
+            log.info("TRAINER received DONE on queue → sent DONE to model queue → exit")
             return
 
         record = item
@@ -283,6 +284,13 @@ def trainer_proc(train_data_q, model_q):
 
         # close out any completed block(s) before ingesting this record
         while ts >= block_end:
+            if sim_done.is_set():
+                model_q.put(DONE)
+                train_data_q.cancel_join_thread()
+                model_q.cancel_join_thread()
+                log.info("TRAINER received DONE event mid-catchup "
+                         "→ sent DONE to model queue → exit")
+                return
             block_id += 1
             version += 1
             trainer_train_block(buf, model, optimizer, scheduler, criterion,
@@ -560,12 +568,6 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
                     if gapps is not None:
                         gapps.send(publish_to_topic, json.dumps(fc_json))
 
-                    #if gappsd_simid is not None:
-                    #    gapps = GridAPPSD(gappsd_simid)
-                    #    assert gapps.connected
-                    #    gapps.send(publish_to_topic, json.dumps(fc_json))
-                    #    gapps.close()
-
                     if fc_count == 1 or fc_count % FORECAST_LOG_EVERY == 0:
                         log.info(f"[FORECAST] #{fc_count} base_time={utc_str(latest_ts)} "
                                  f"using model v{current_version} | {len(fc_json['Forecast']['nodes'])} nodes")
@@ -600,6 +602,8 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
         if data_done and model_saw_done:
             log.info(f"FORECASTER received DONE on both queues → exit "
                      f"(total forecasts: {fc_count}, final model v{current_version})")
+            fc_data_q.cancel_join_thread()
+            model_q.cancel_join_thread()
             return
 
         # 5) avoid busy-spin when idle
@@ -627,13 +631,15 @@ def main():
     train_data_q = mp.Queue()
     fc_data_q = mp.Queue()
     model_q = mp.Queue()
+    sim_done = mp.Event()
 
     procs = [
         mp.Process(target=feeder_proc,
-                   args=(train_data_q, fc_data_q, gappsd_simid, JSON_PATH),
+                   args=(train_data_q, fc_data_q, sim_done,
+                         gappsd_simid, JSON_PATH),
                    name="feeder"),
         mp.Process(target=trainer_proc,
-                   args=(train_data_q, model_q),
+                   args=(train_data_q, model_q, sim_done),
                    name="trainer"),
         mp.Process(target=forecaster_proc,
                    args=(fc_data_q, model_q, gappsd_simid),
