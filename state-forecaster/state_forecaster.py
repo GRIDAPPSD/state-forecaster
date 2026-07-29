@@ -861,10 +861,13 @@ def feeder_proc(train_data_q, fc_data_q, sim_done, gappsd_simid, data_path):
     for record in read_json_records(data_path):
         emit(record, pace=True)
 
+    sim_done.set()
     train_data_q.put(DONE)
     fc_data_q.put(DONE)
     log.info(f"FEEDER done | total={n_real} real + {n_imp} imputed "
              f"| last_ts={utc_str(last_ts) if last_ts else 'n/a'} | sent DONE")
+    train_data_q.cancel_join_thread()
+    fc_data_q.cancel_join_thread()
 
 
 # =====================================================
