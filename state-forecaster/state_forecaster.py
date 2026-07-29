@@ -110,7 +110,7 @@ OUTPUT_DIM = FUT * 2
 
 #FEED_RATE_HZ = 1.0          # records/sec the feeder emits (real ~1; >1 speeds testing)
 #FEED_RATE_HZ = 4.0          # records/sec the feeder emits (real ~1; >1 speeds testing)
-FEED_RATE_HZ = 20.0          # records/sec the feeder emits (real ~1; >1 speeds testing)
+FEED_RATE_HZ = 50.0          # records/sec the feeder emits (real ~1; >1 speeds testing)
 FORECASTER_POLL_SEC = 0.05   # forecaster idle poll interval when no work is pending
 FEEDER_POLL_SEC = 0.05       # feeder idle poll interval
 LOG_DIR = "."
