@@ -120,6 +120,7 @@ FEEDER_LOG = f"{LOG_DIR}/feeder.log"
 
 DONE = "__DONE__"           # sentinel Queue item meaning "end of stream"
 
+
 # =====================================================
 # Start from forecaster_single.py
 # =====================================================
@@ -132,31 +133,37 @@ def _pq_value(x):
     return float(x)
 
 
+def parse_sv_entry(entry):
+    """Parse one SvEstVoltages entry into (node_key, node_values).
+    Single source of truth for entry interpretation, shared by the bus callback
+    and the file reader. Node key = ConnectivityNode + "." + phase (Approach 3);
+    phase used as-is, empty phase falls back to bare ConnectivityNode. vpu -> V
+    (per-unit), ang (radians); P/Q "NA" -> 0.0. V/Angle not
+    NA-coerced (missing voltage/angle should fail loudly)."""
+    cn = entry["ConnectivityNode"]
+    phase = entry["phase"]
+    node_key = f"{cn}.{phase}" if phase != "" else cn
+    node_vals = {
+        "P": _pq_value(entry["P"]),
+        "Q": _pq_value(entry["Q"]),
+        "V": float(entry["vpu"]),
+        "Angle": float(entry["angleRad"]),
+    }
+    return node_key, node_vals
+
+
+def sv_entries_to_nodes(sv_entries):
+    """Build the internal {node_key: {P,Q,V,Angle}} dict from a SvEstVoltages list."""
+    nodes = {}
+    for entry in sv_entries:
+        node_key, node_vals = parse_sv_entry(entry)
+        nodes[node_key] = node_vals
+    return nodes
+
+
 def read_json_records(path):
-    """Yield one internal record per line, parsed from the GridAPPS-D State
-    Estimator publish format (SvEstVoltages).
-
-    Input line (real format):
-        {"SvEstVoltages": [{"ConnectivityNode": "632", "phase": "1",
-                             "P": .., "Q": .., "v": .., "angle": ..}, ...],
-         "timeStamp": 1700000000}
-
-    Yields internal record (unchanged downstream shape):
-        {"timestamp": 1700000000,
-         "nodes": {"632.1": {"P": .., "Q": .., "V": .., "Angle": ..}, ...}}
-
-    Notes:
-      * Internal node key = ConnectivityNode + "." + phase (e.g. "632" + "1"
-        -> "632.1"). This single combined key is the NN's node identity
-        (Approach 3: combined internally, split back to separate fields only
-        at output in build_forecast_json). Phase is used AS-IS (no mapping);
-        dots are only ever separators, never part of a ConnectivityNode value.
-      * vpu -> V, angleRad -> Angle
-      * P/Q == "NA" -> 0.0 (SOURCEBUS etc.). V and angle are NOT NA-coerced:
-        a missing voltage/angle should fail loudly rather than be silently
-        zeroed into the history window.
-      * variance fields (angleVariance, vVariance) are ignored.
-    """
+    """Yield one internal record per line from the SE-written .jsonl file.
+    (Envelope: {"timeStamp": ..., "SvEstVoltages": [...]}.)"""
     with open(path, "r") as f:
         for line in f:
             line = line.strip()
@@ -164,17 +171,7 @@ def read_json_records(path):
                 continue
             rec = json.loads(line)
             ts = int(rec["timeStamp"])
-            nodes = {}
-            for entry in rec["SvEstVoltages"]:
-                cn = entry["ConnectivityNode"]
-                phase = entry["phase"]
-                node_key = f"{cn}.{phase}" if phase != "" else cn
-                nodes[node_key] = {
-                    "P": _pq_value(entry["P"]),
-                    "Q": _pq_value(entry["Q"]),
-                    "V": float(entry["vpu"]),
-                    "Angle": float(entry["angleRad"]),
-                }
+            nodes = sv_entries_to_nodes(rec["SvEstVoltages"])   # shared
             yield {"timestamp": ts, "nodes": nodes}
 
 
@@ -833,19 +830,10 @@ def feeder_proc(train_data_q, fc_data_q, sim_done, gappsd_simid, data_path):
                     keepLoopingFlag = False
                 return
             # unwrap: message -> message -> Estimate -> SvEstVoltages
-            msgdict = message['message']
-            ts = int(msgdict['timestamp'])
-            sv = msgdict['Estimate']['SvEstVoltages']
+            est = message['message']['Estimate']
+            ts = int(est['timeStamp'])
+            nodes = sv_entries_to_nodes(est['SvEstVoltages'])
             # build internal record: {"timestamp", "nodes": {key: {P,Q,V,Angle}}}
-            nodes = {}
-            for entry in sv:
-                node_key = f"{entry['ConnectivityNode']}.{entry['phase']}"
-                nodes[node_key] = {
-                    "P": _pq_value(entry["P"]),
-                    "Q": _pq_value(entry["Q"]),
-                    "V": float(entry["vpu"]),
-                    "Angle": float(entry["angleRad"]),
-                }
             emit({"timestamp": ts, "nodes": nodes})   # no pacing on bus
 
         gapps = GridAPPSD(gappsd_simid)
