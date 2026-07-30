@@ -1,4 +1,3 @@
-
 import os
 import io
 import time
@@ -10,26 +9,44 @@ from itertools import islice
 
 import torch
 
-from forecast_common import (utc_str, setup_logger, LOG_DIR, TS_INCREMENT_SEC,
-                             DONE)
-from forecast_dnn import (RollingBuffer, build_model, assemble_input_vector,
-                          apply_scaler_state, time_features, HIST, FUT,
-                          USE_CURRENT_PQ, RETENTION_SEC, DAY_LAG_SEC,
-                          WEEK_LAG_SEC, DEVICE)
-
+from forecast_common import (
+    utc_str,
+    setup_logger,
+    LOG_DIR,
+    TS_INCREMENT_SEC,
+    DONE,
+)
+from forecast_dnn import (
+    RollingBuffer,
+    build_model,
+    assemble_input_vector,
+    apply_scaler_state,
+    time_features,
+    HIST,
+    FUT,
+    USE_CURRENT_PQ,
+    RETENTION_SEC,
+    DAY_LAG_SEC,
+    WEEK_LAG_SEC,
+    DEVICE,
+)
 
 FORECASTER_LOG = f"{LOG_DIR}/forecaster.log"
 
 FORECAST_OUTPUT_JSONL = f"{LOG_DIR}/forecast_output.jsonl"
 
-FORECASTER_POLL_SEC = 0.05   # forecaster idle poll interval when no work is pending
+FORECASTER_POLL_SEC = (
+    0.05  # forecaster idle poll interval when no work is pending
+)
 
-COMPUTE_LIVE_MAE = True   # deferred scoring: score one forecast per model
-                          # version against the actual estimates that later
-                          # arrive. Off for production-speed runs.
+COMPUTE_LIVE_MAE = True  # deferred scoring: score one forecast per model
+# version against the actual estimates that later
+# arrive. Off for production-speed runs.
 
 
-def build_forecast_json(preds, nids, base_ts, buf, base_time=None, simulation_id=None):
+def build_forecast_json(
+    preds, nids, base_ts, buf, base_time=None, simulation_id=None
+):
     """Assemble the per-node forecast JSON for ONE base timestamp.
     This is the output unit that will later be published to the GridAPPS-D bus
     (one structure per forecast actually run). Physical units; epoch seconds.
@@ -44,11 +61,13 @@ def build_forecast_json(preds, nids, base_ts, buf, base_time=None, simulation_id
     if base_time is None:
         base_time = int(base_ts.max())
 
-    row_mask = (base_ts == base_time)
+    row_mask = base_ts == base_time
     sel_preds = preds[row_mask]
     sel_nids = nids[row_mask]
 
-    forecast_times = [int(base_time + TS_INCREMENT_SEC * (k + 1)) for k in range(FUT)]
+    forecast_times = [
+        int(base_time + TS_INCREMENT_SEC * (k + 1)) for k in range(FUT)
+    ]
 
     nodes_out = {}
     for row, nid in zip(sel_preds, sel_nids):
@@ -67,9 +86,9 @@ def build_forecast_json(preds, nids, base_ts, buf, base_time=None, simulation_id
         }
 
     return {
-        "timestamp": int(base_time),     # top-level: generic ADMS field
+        "timestamp": int(base_time),  # top-level: generic ADMS field
         "simulation_id": simulation_id,  # top-level: generic ADMS field
-        "Forecast": {                    # forecast-specific payload nested here
+        "Forecast": {  # forecast-specific payload nested here
             "step_sec": TS_INCREMENT_SEC,
             "horizon": FUT,
             "forecast_times": forecast_times,
@@ -122,7 +141,10 @@ def drain_all(q):
 # Each loop: check MODEL queue FIRST (load newest, honor DONE), then take
 # latest data record and "forecast" (stub logs). Real forecast+JSON in Piece 3.
 # =====================================================
-FORECAST_LOG_EVERY = 200   # stub: log 1 of every N forecasts (avoids per-poll flood)
+FORECAST_LOG_EVERY = (
+    200  # stub: log 1 of every N forecasts (avoids per-poll flood)
+)
+
 
 def normalize_row(scalers, V, ang, P, Q, ts):
     """Normalize one raw row into [V,ang,P,Q,sin,cos] float32 using given scalers.
@@ -141,10 +163,11 @@ class NormStore:
     (ts, norm_row) for the position-based HIST window, and a {ts: norm_row}
     dict for O(1) lag lookups. Incremental on append; full rebuild only when
     scalers change (snapshot arrival)."""
+
     def __init__(self, num_nodes):
         self.num_nodes = num_nodes
-        self.rows = {nid: deque() for nid in range(num_nodes)}     # (ts, norm_row)
-        self.by_ts = {nid: {} for nid in range(num_nodes)}         # ts -> norm_row
+        self.rows = {nid: deque() for nid in range(num_nodes)}  # (ts, norm_row)
+        self.by_ts = {nid: {} for nid in range(num_nodes)}  # ts -> norm_row
 
     def append(self, nid, ts, norm_row):
         self.rows[nid].append((ts, norm_row))
@@ -164,7 +187,7 @@ class NormStore:
         for nid in range(self.num_nodes):
             self.rows[nid].clear()
             self.by_ts[nid].clear()
-            for (ts, V, ang, P, Q) in buf.raw[nid]:
+            for ts, V, ang, P, Q in buf.raw[nid]:
                 nr = normalize_row(scalers, V, ang, P, Q, ts)
                 self.rows[nid].append((ts, nr))
                 self.by_ts[nid][ts] = nr
@@ -182,28 +205,42 @@ def forecast_latest(model, store, buf, latest_ts, log):
             continue  # not enough consecutive history yet
 
         # last HIST+1 rows: the final one is the base (latest_ts), the prior HIST are history
-        recent = list(islice(reversed(dq), 0, HIST + 1))  # newest-first, length HIST+1
-        recent.reverse()                                   # oldest-first
+        recent = list(
+            islice(reversed(dq), 0, HIST + 1)
+        )  # newest-first, length HIST+1
+        recent.reverse()  # oldest-first
         base_ts, base_row = recent[-1]
         if base_ts != latest_ts:
             continue  # this node has no row exactly at latest_ts (gap) — skip it
 
-        hist_rows = recent[:HIST]                          # HIST rows before base
+        hist_rows = recent[:HIST]  # HIST rows before base
         hist_va = torch.tensor(
-            np.concatenate([r[0:2] for (_, r) in hist_rows]), dtype=torch.float32)
+            np.concatenate([r[0:2] for (_, r) in hist_rows]),
+            dtype=torch.float32,
+        )
 
         base_np = base_row if USE_CURRENT_PQ else recent[-2][1]
         base_pq = torch.tensor(base_np[2:4], dtype=torch.float32)
 
         day_np = store.by_ts[nid].get(latest_ts - DAY_LAG_SEC, None)
         week_np = store.by_ts[nid].get(latest_ts - WEEK_LAG_SEC, None)
-        day_row = torch.tensor(day_np, dtype=torch.float32) if day_np is not None else None
-        week_row = torch.tensor(week_np, dtype=torch.float32) if week_np is not None else None
+        day_row = (
+            torch.tensor(day_np, dtype=torch.float32)
+            if day_np is not None
+            else None
+        )
+        week_row = (
+            torch.tensor(week_np, dtype=torch.float32)
+            if week_np is not None
+            else None
+        )
 
         time_feat = torch.tensor(base_row[4:6], dtype=torch.float32)
         phase = buf.phase[nid]
 
-        X = assemble_input_vector(hist_va, base_pq, day_row, week_row, phase, time_feat)
+        X = assemble_input_vector(
+            hist_va, base_pq, day_row, week_row, phase, time_feat
+        )
         X_list.append(X)
         nid_list.append(nid)
 
@@ -233,20 +270,25 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
     if gappsd_simid is not None:
         from gridappsd import GridAPPSD
         from gridappsd.topics import service_output_topic
-        os.environ['GRIDAPPSD_APPLICATION_ID'] = 'state-forecaster'
-        os.environ['GRIDAPPSD_APPLICATION_STATUS'] = 'STARTED'
-        os.environ['GRIDAPPSD_USER'] = 'app_user'
-        os.environ['GRIDAPPSD_PASSWORD'] = '1234App'
+
+        os.environ["GRIDAPPSD_APPLICATION_ID"] = "state-forecaster"
+        os.environ["GRIDAPPSD_APPLICATION_STATUS"] = "STARTED"
+        os.environ["GRIDAPPSD_USER"] = "app_user"
+        os.environ["GRIDAPPSD_PASSWORD"] = "1234App"
         gapps = GridAPPSD(gappsd_simid)
         assert gapps.connected
-        log.info(f"FORECASTER connected to GridAPPS-D simid={gappsd_simid} "
-                 f"for publishing forecasts")
-        publish_to_topic = service_output_topic('state-forecaster', gappsd_simid)
+        log.info(
+            f"FORECASTER connected to GridAPPS-D simid={gappsd_simid} "
+            f"for publishing forecasts"
+        )
+        publish_to_topic = service_output_topic(
+            "state-forecaster", gappsd_simid
+        )
 
     buf = None
     model = None
-    store = None          # NormStore (incremental normalized rows)
-    scalers = None        # (sc_V, sc_ang, sc_P, sc_Q) — refs into buf's scalers
+    store = None  # NormStore (incremental normalized rows)
+    scalers = None  # (sc_V, sc_ang, sc_P, sc_Q) — refs into buf's scalers
     have_scalers = False  # True once first snapshot applied
     current_version = 0
     pending_snap = None
@@ -255,9 +297,9 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
     warmup_logged = False
 
     # --- deferred live MAE scoring state ---
-    score_armed = False        # arm on snapshot adoption
-    pending = None             # {"remaining": set(ts), "pred": {ts: {node: (V, Ang)}},
-                               #  "abs_v": [...], "abs_a": [...], "n": 0, "version": int}
+    score_armed = False  # arm on snapshot adoption
+    pending = None  # {"remaining": set(ts), "pred": {ts: {node: (V, Ang)}},
+    #  "abs_v": [...], "abs_a": [...], "n": 0, "version": int}
 
     # Forecast-output file: truncate any existing file at startup, then append
     # one JSON line per published forecast (open/append/close per write --
@@ -265,7 +307,7 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
     # Opened once here, written per forecast, closed at exit
     if FORECAST_OUTPUT_JSONL:
         with open(FORECAST_OUTPUT_JSONL, "w"):
-            pass # create/truncate to empty
+            pass  # create/truncate to empty
         log.info(f"Writing published forecasts to {FORECAST_OUTPUT_JSONL}")
 
     def score_pending(record):
@@ -281,24 +323,26 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
         for node, vals in record["nodes"].items():
             p = pred_at.get(node)
             if p is None:
-                continue                      # node not in forecast — skip (defensive)
+                continue  # node not in forecast — skip (defensive)
             pending["abs_v"] += abs(p[0] - vals["V"])
             pending["abs_a"] += abs(p[1] - vals["Angle"])
             pending["n"] += 1
         pending["remaining"].discard(ts)
-        if not pending["remaining"]:          # all horizon steps collected
+        if not pending["remaining"]:  # all horizon steps collected
             n = max(pending["n"], 1)
-            log.info(f"[MAE] v{pending['version']} base_time="
-                     f"{utc_str(pending['base_time'])} | "
-                     f"Voltage MAE (pu): {pending['abs_v']/n:.6f} | "
-                     f"Angle MAE (rad): {pending['abs_a']/n:.6f} "
-                     f"({pending['n']} node-steps)")
+            log.info(
+                f"[MAE] v{pending['version']} base_time="
+                f"{utc_str(pending['base_time'])} | "
+                f"Voltage MAE (pu): {pending['abs_v']/n:.6f} | "
+                f"Angle MAE (rad): {pending['abs_a']/n:.6f} "
+                f"({pending['n']} node-steps)"
+            )
             pending = None
 
     def ingest(record):
         """Append raw to buf; if scalers known, incrementally normalize into store."""
         ts = int(record["timestamp"])
-        buf.append_record(record)   # updates buf.raw + buf.newest_ts
+        buf.append_record(record)  # updates buf.raw + buf.newest_ts
         if have_scalers:
             for node_name, vals in record["nodes"].items():
                 nid = buf.node_to_id.get(node_name)
@@ -313,7 +357,7 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
         if buf.newest_ts is None:
             return
         cutoff = buf.newest_ts - RETENTION_SEC
-        buf.evict_old()                 # raw
+        buf.evict_old()  # raw
         if store is not None:
             store.evict_before(cutoff)  # normalized
 
@@ -322,19 +366,25 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
         snap, model_saw_done = drain_latest(model_q)
         if snap is not None:
             if buf is None:
-                pending_snap = snap   # arrived before first data; apply after init
+                pending_snap = (
+                    snap  # arrived before first data; apply after init
+                )
             else:
                 blob = torch.load(io.BytesIO(snap["blob"]), map_location="cpu")
                 model.load_state_dict(blob["weights"])
                 apply_scaler_state(buf, blob["scaler_state"])
-                store.rebuild_from_raw(buf, scalers)   # full re-normalize (rare)
+                store.rebuild_from_raw(buf, scalers)  # full re-normalize (rare)
                 have_scalers = True
                 current_version = snap["version"]
                 if COMPUTE_LIVE_MAE:
-                    score_armed = True   # score the NEXT forecast made under this version
-                log.info(f"adopted snapshot v{current_version} "
-                         f"→ scalers updated, store re-normalized "
-                         f"({sum(len(store.rows[n]) for n in range(store.num_nodes))} rows)")
+                    score_armed = (
+                        True  # score the NEXT forecast made under this version
+                    )
+                log.info(
+                    f"adopted snapshot v{current_version} "
+                    f"→ scalers updated, store re-normalized "
+                    f"({sum(len(store.rows[n]) for n in range(store.num_nodes))} rows)"
+                )
 
         # 2) DATA QUEUE: drain ALL (keep-all, gapless), ingest in order.
         records, data_saw_done = drain_all(fc_data_q)
@@ -352,10 +402,13 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
                 model, *_ = build_model(buf.num_nodes)
                 store = NormStore(buf.num_nodes)
                 scalers = (buf.sc_V, buf.sc_ang, buf.sc_P, buf.sc_Q)
-                log.info(f"lazy-init | {buf.num_nodes} nodes | first_ts={utc_str(int(record['timestamp']))}")
+                log.info(
+                    f"lazy-init | {buf.num_nodes} nodes | first_ts={utc_str(int(record['timestamp']))}"
+                )
                 if pending_snap is not None:
-                    blob = torch.load(io.BytesIO(pending_snap["blob"]),
-                                      map_location="cpu")
+                    blob = torch.load(
+                        io.BytesIO(pending_snap["blob"]), map_location="cpu"
+                    )
                     model.load_state_dict(blob["weights"])
                     apply_scaler_state(buf, blob["scaler_state"])
                     have_scalers = True
@@ -367,7 +420,7 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
             latest_ts = int(record["timestamp"])
             latest_imputed = bool(record.get("_imputed", False))
             if COMPUTE_LIVE_MAE and not latest_imputed:
-                score_pending(record)      # deferred MAE on real estimates only
+                score_pending(record)  # deferred MAE on real estimates only
 
         if records:
             evict()
@@ -378,15 +431,20 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
         # a [imp, ..., real] burst, the latest drained record is normally real;
         # if a drain lands mid-burst on an imputed record, we simply skip this
         # cycle and forecast on the real record that arrives next cycle.
-        if latest_ts is not None and not latest_imputed:      # NEW: skip if imputed
+        if latest_ts is not None and not latest_imputed:  # NEW: skip if imputed
             if have_scalers:
                 result = forecast_latest(model, store, buf, latest_ts, log)
                 if result is not None:
                     preds, nids, base_ts_arr = result
                     fc_count += 1
-                    fc_json = build_forecast_json(preds, nids, base_ts_arr, buf,
-                                                  base_time=latest_ts,
-                                                  simulation_id=gappsd_simid)
+                    fc_json = build_forecast_json(
+                        preds,
+                        nids,
+                        base_ts_arr,
+                        buf,
+                        base_time=latest_ts,
+                        simulation_id=gappsd_simid,
+                    )
 
                     if gapps is not None:
                         gapps.send(publish_to_topic, json.dumps(fc_json))
@@ -395,9 +453,11 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
                             f.write(json.dumps(fc_json) + "\n")
 
                     if fc_count == 1 or fc_count % FORECAST_LOG_EVERY == 0:
-                        log.info(f"[FORECAST] #{fc_count} base_time={utc_str(latest_ts)} "
-                                 f"using model v{current_version} | {len(fc_json['Forecast']['nodes'])} nodes")
-                        #log.info(json.dumps(fc_json))
+                        log.info(
+                            f"[FORECAST] #{fc_count} base_time={utc_str(latest_ts)} "
+                            f"using model v{current_version} | {len(fc_json['Forecast']['nodes'])} nodes"
+                        )
+                        # log.info(json.dumps(fc_json))
 
                     if COMPUTE_LIVE_MAE and score_armed:
                         pred = {}
@@ -405,33 +465,45 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
                             ft = fc_json["Forecast"]["forecast_times"][k]
                             pred[ft] = {
                                 node: (nd["V"][k], nd["Angle"][k])
-                                for node, nd in fc_json["Forecast"]["nodes"].items()
+                                for node, nd in fc_json["Forecast"][
+                                    "nodes"
+                                ].items()
                             }
                         pending = {
                             "remaining": set(pred.keys()),
                             "pred": pred,
-                            "abs_v": 0.0, "abs_a": 0.0, "n": 0,
+                            "abs_v": 0.0,
+                            "abs_a": 0.0,
+                            "n": 0,
                             "version": current_version,
                             "base_time": latest_ts,
                         }
                         score_armed = False
-                        log.info(f"[MAE] armed: scoring forecast v{current_version} "
-                                 f"base_time={utc_str(latest_ts)} over {FUT} steps")
+                        log.info(
+                            f"[MAE] armed: scoring forecast v{current_version} "
+                            f"base_time={utc_str(latest_ts)} over {FUT} steps"
+                        )
 
             else:
                 if not warmup_logged:
-                    log.info(f"latest_ts={utc_str(latest_ts)} | no model yet "
-                             f"(warm-up) — skipping forecasts until first snapshot")
+                    log.info(
+                        f"latest_ts={utc_str(latest_ts)} | no model yet "
+                        f"(warm-up) — skipping forecasts until first snapshot"
+                    )
                     warmup_logged = True
 
         # 4) shutdown when BOTH streams exhausted.
         if data_done and model_saw_done:
-            log.info(f"FORECASTER received DONE on both queues → exit "
-                     f"(total forecasts: {fc_count}, final model v{current_version})")
+            log.info(
+                f"FORECASTER received DONE on both queues → exit "
+                f"(total forecasts: {fc_count}, final model v{current_version})"
+            )
 
             if gapps is not None:
-                done_json = {"simulation_id": gappsd_simid,
-                             "processStatus": "COMPLETE"}
+                done_json = {
+                    "simulation_id": gappsd_simid,
+                    "processStatus": "COMPLETE",
+                }
                 gapps.send(publish_to_topic, json.dumps(done_json))
 
             fc_data_q.cancel_join_thread()
@@ -441,4 +513,3 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
         # 5) avoid busy-spin when idle
         if not records and snap is None:
             time.sleep(FORECASTER_POLL_SEC)
-

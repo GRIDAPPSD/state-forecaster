@@ -1,4 +1,3 @@
-
 import math
 import numpy as np
 
@@ -8,32 +7,32 @@ from collections import deque
 import torch
 import torch.nn as nn
 
-DROPOUT_P = 0.03               # training regularization only (no MC dropout)
-MAX_WINDOW_SAMPLES = 500_000   # cap: bounds per-block memory AND train time.
+DROPOUT_P = 0.03  # training regularization only (no MC dropout)
+MAX_WINDOW_SAMPLES = 500_000  # cap: bounds per-block memory AND train time.
 
 # --- history / horizon (in SAMPLES, i.e. timestamps) ---
-HIST = 15               # past samples used as input (15 min @ 1-min)
-FUT = 15                # future samples to forecast (15 min @ 1-min)
+HIST = 15  # past samples used as input (15 min @ 1-min)
+FUT = 15  # future samples to forecast (15 min @ 1-min)
 
 INPUT_DIM = (
-    HIST * 2 +   # historical V, angle
-    2 +          # current or previous P,Q
-    2 +          # 1-day lag P,Q
-    2 +          # 1-day lag V, angle
-    1 +          # 1-day lag availability flag
-    2 +          # 1-week lag P,Q
-    2 +          # 1-week lag V, angle
-    1 +          # 1-week lag availability flag
-    3 +          # phase
-    2            # sin_time, cos_time
+    HIST * 2  # historical V, angle
+    + 2  # current or previous P,Q
+    + 2  # 1-day lag P,Q
+    + 2  # 1-day lag V, angle
+    + 1  # 1-day lag availability flag
+    + 2  # 1-week lag P,Q
+    + 2  # 1-week lag V, angle
+    + 1  # 1-week lag availability flag
+    + 3  # phase
+    + 2  # sin_time, cos_time
 )
 OUTPUT_DIM = FUT * 2
 
 # --- lag features (in TIME, converted to seconds) ---
-DAY_LAG_SEC = 1 * 24 * 3600    # 1-day lag
-WEEK_LAG_SEC = 7 * 24 * 3600   # 1-week lag
+DAY_LAG_SEC = 1 * 24 * 3600  # 1-day lag
+WEEK_LAG_SEC = 7 * 24 * 3600  # 1-week lag
 
-RETENTION_DAYS = 10        # rolling buffer horizon (see rationale below)
+RETENTION_DAYS = 10  # rolling buffer horizon (see rationale below)
 # Rationale for RETENTION_DAYS:
 #   * >= 7 days: distribution load has a WEEKLY trend; a full week must be
 #     retained so the 1-week lag feature is populated (not zero-flagged).
@@ -79,7 +78,9 @@ def encode_phase(load_node):
     }.get(p, np.zeros(3, dtype=np.float32))
 
 
-def assemble_input_vector(hist_va, base_pq, day_row, week_row, phase, time_feat):
+def assemble_input_vector(
+    hist_va, base_pq, day_row, week_row, phase, time_feat
+):
     """Single source of truth for the model input layout.
     Used identically by the trainer (ReplayDataset) and the forecaster.
 
@@ -111,18 +112,20 @@ def assemble_input_vector(hist_va, base_pq, day_row, week_row, phase, time_feat)
         week_va = week_row[0:2]
         week_flag = torch.ones(1, dtype=torch.float32)
 
-    return torch.cat([
-        hist_va,          # HIST * 2
-        base_pq,          # 2
-        day_pq,           # 2
-        day_va,           # 2
-        day_flag,         # 1
-        week_pq,          # 2
-        week_va,          # 2
-        week_flag,        # 1
-        phase,            # 3
-        time_feat         # 2
-    ])
+    return torch.cat(
+        [
+            hist_va,  # HIST * 2
+            base_pq,  # 2
+            day_pq,  # 2
+            day_va,  # 2
+            day_flag,  # 1
+            week_pq,  # 2
+            week_va,  # 2
+            week_flag,  # 1
+            phase,  # 3
+            time_feat,  # 2
+        ]
+    )
 
 
 # =====================================================
@@ -131,9 +134,11 @@ def assemble_input_vector(hist_va, base_pq, day_row, week_row, phase, time_feat)
 # =====================================================
 class RunningMinMax:
     """Streaming MinMaxScaler for a single feature. Maps to [0, 1]."""
+
     def __init__(self):
         self.min = math.inf
         self.max = -math.inf
+
     def update(self, values):
         if len(values) == 0:
             return
@@ -143,11 +148,13 @@ class RunningMinMax:
             self.min = vmin
         if vmax > self.max:
             self.max = vmax
+
     def transform(self, x):
         rng = self.max - self.min
         if rng == 0 or not math.isfinite(rng):
             return np.zeros_like(x, dtype=np.float64)
         return (x - self.min) / rng
+
     def inverse(self, x_scaled):
         rng = self.max - self.min
         return x_scaled * rng + self.min
@@ -155,10 +162,12 @@ class RunningMinMax:
 
 class RunningStandardizer:
     """Streaming StandardScaler via Welford/Chan parallel variance."""
+
     def __init__(self):
         self.n = 0
         self.mean = 0.0
         self.M2 = 0.0
+
     def update(self, values):
         if len(values) == 0:
             return
@@ -174,14 +183,17 @@ class RunningStandardizer:
         self.mean += delta * nb / tot
         self.M2 += M2b + delta * delta * self.n * nb / tot
         self.n = tot
+
     @property
     def std(self):
         if self.n < 2:
             return 1.0
         s = math.sqrt(self.M2 / self.n)
         return s if s > 0 else 1.0
+
     def transform(self, x):
         return (x - self.mean) / self.std
+
     def inverse(self, x_scaled):
         return x_scaled * self.std + self.mean
 
@@ -189,9 +201,9 @@ class RunningStandardizer:
 def extract_scaler_state(buf):
     """Snapshot the four incremental scalers' state (plain picklable numbers)."""
     return {
-        "P":   (buf.sc_P.min, buf.sc_P.max),
-        "Q":   (buf.sc_Q.min, buf.sc_Q.max),
-        "V":   (buf.sc_V.min, buf.sc_V.max),
+        "P": (buf.sc_P.min, buf.sc_P.max),
+        "Q": (buf.sc_Q.min, buf.sc_Q.max),
+        "V": (buf.sc_V.min, buf.sc_V.max),
         "ang": (buf.sc_ang.n, buf.sc_ang.mean, buf.sc_ang.M2),
     }
 
@@ -218,11 +230,15 @@ class RollingBuffer:
         self.num_nodes = len(self.node_names)
         # per node_id: deque of (ts, V, ang, P, Q) in time order
         self.raw = {nid: deque() for nid in range(self.num_nodes)}
-        self.phase = {nid: torch.tensor(encode_phase(n), dtype=torch.float32)
-                      for nid, n in self.id_to_node.items()}
+        self.phase = {
+            nid: torch.tensor(encode_phase(n), dtype=torch.float32)
+            for nid, n in self.id_to_node.items()
+        }
         # rebuilt each block:
-        self.tensors = {}       # nid -> float32 [T,6]: V,ang,P,Q,sin,cos (normalized)
-        self.pos_by_ts = {}     # nid -> {ts: row index}
+        self.tensors = (
+            {}
+        )  # nid -> float32 [T,6]: V,ang,P,Q,sin,cos (normalized)
+        self.pos_by_ts = {}  # nid -> {ts: row index}
         self.newest_ts = None
         # scalers
         self.sc_P = RunningMinMax()
@@ -255,9 +271,12 @@ class RollingBuffer:
         """Update running scalers using ONLY this block's raw values (causal)."""
         Ps, Qs, Vs, As = [], [], [], []
         for dq in self.raw.values():
-            for (ts, V, A, P, Q) in dq:
+            for ts, V, A, P, Q in dq:
                 if block_start <= ts < block_end:
-                    Vs.append(V); As.append(A); Ps.append(P); Qs.append(Q)
+                    Vs.append(V)
+                    As.append(A)
+                    Ps.append(P)
+                    Qs.append(Q)
         self.sc_V.update(np.asarray(Vs, dtype=np.float64))
         self.sc_ang.update(np.asarray(As, dtype=np.float64))
         self.sc_P.update(np.asarray(Ps, dtype=np.float64))
@@ -265,7 +284,8 @@ class RollingBuffer:
 
     def rebuild_normalized(self):
         """Rebuild per-node normalized tensors + ts->pos maps from raw buffers,
-        using the CURRENT scaler state. Called once per block after scalers update."""
+        using the CURRENT scaler state. Called once per block after scalers update.
+        """
         self.tensors = {}
         self.pos_by_ts = {}
         for nid, dq in self.raw.items():
@@ -283,7 +303,8 @@ class RollingBuffer:
             coss = np.empty(len(arr), dtype=np.float64)
             for i, ts in enumerate(ts_col):
                 s, c = time_features(int(ts))
-                sins[i] = s; coss[i] = c
+                sins[i] = s
+                coss[i] = c
             mat = np.stack([Vn, An, Pn, Qn, sins, coss], axis=1)
             self.tensors[nid] = torch.tensor(mat, dtype=torch.float32)
             self.pos_by_ts[nid] = {int(ts): i for i, ts in enumerate(ts_col)}
@@ -305,7 +326,9 @@ class RollingBuffer:
             for t in self._valid_positions(nid):
                 idx.append((nid, t, pos_ts[t]))
         if len(idx) > MAX_WINDOW_SAMPLES:
-            chosen = np.random.choice(len(idx), MAX_WINDOW_SAMPLES, replace=False)
+            chosen = np.random.choice(
+                len(idx), MAX_WINDOW_SAMPLES, replace=False
+            )
             idx = [idx[i] for i in chosen]
         return idx
 
@@ -323,6 +346,7 @@ class RollingBuffer:
                     fc.append((nid, t, base_ts))
         return fc
 
+
 # =====================================================
 # MODEL
 # =====================================================
@@ -339,6 +363,7 @@ class DNN(nn.Module):
             nn.Dropout(dropout_p),
             nn.Linear(128, OUTPUT_DIM),
         )
+
     def forward(self, x, nid):
         emb = self.node_emb(nid)
         return self.net(torch.cat([x, emb], dim=1))
@@ -349,8 +374,9 @@ def build_model(num_nodes):
     # --- FUTURE HOOK (Change 3): model.share_memory() before spawning the
     #     forecast process so weight updates propagate without files. ---
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.6)
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer, step_size=3, gamma=0.6
+    )
     criterion = nn.MSELoss()
-    scaler_amp = torch.amp.GradScaler('cuda', enabled=(DEVICE == "cuda"))
+    scaler_amp = torch.amp.GradScaler("cuda", enabled=(DEVICE == "cuda"))
     return model, optimizer, scheduler, criterion, scaler_amp
-
