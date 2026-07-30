@@ -3,7 +3,7 @@ import logging
 
 from datetime import datetime, timezone
 
-LOG_DIR = "."
+LOG_DIR = "./logs"
 
 # --- streaming cadence ---
 #TS_INCREMENT_SEC = 3        # timestamp spacing in the input stream (real-time)

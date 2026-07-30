@@ -20,7 +20,7 @@ from forecast_dnn import (RollingBuffer, build_model, assemble_input_vector,
 
 FORECASTER_LOG = f"{LOG_DIR}/forecaster.log"
 
-FORECAST_OUTPUT_JSONL = "forecast_output.jsonl"
+FORECAST_OUTPUT_JSONL = f"{LOG_DIR}/forecast_output.jsonl"
 
 FORECASTER_POLL_SEC = 0.05   # forecaster idle poll interval when no work is pending
 
