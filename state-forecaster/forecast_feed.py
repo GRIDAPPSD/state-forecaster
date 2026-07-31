@@ -216,7 +216,7 @@ def make_imputer(increment_sec):
 # a shared emit() that enqueues the resulting burst to BOTH data queues.
 # =====================================================
 def feeder_proc(train_data_q, fc_data_q, sim_done, gappsd_simid):
-    log = setup_logger("data feeder", FEEDER_LOG)
+    log = setup_logger("data_feeder", FEEDER_LOG)
 
     # Per-record imputer step + cadence-guard (shared by whichever driver runs).
     step = make_imputer(TS_INCREMENT_SEC)
@@ -284,7 +284,7 @@ def feeder_proc(train_data_q, fc_data_q, sim_done, gappsd_simid):
             estimateCallback,
         )
         log.info(
-            f"FEEDER start | GridAPPS-D simid={gappsd_simid} "
+            f"DATA_FEEDER start | GridAPPS-D simid={gappsd_simid} "
             f"| increment={TS_INCREMENT_SEC}s"
         )
 
@@ -294,7 +294,7 @@ def feeder_proc(train_data_q, fc_data_q, sim_done, gappsd_simid):
     else:
         # ---------- FILE DRIVER ----------
         log.info(
-            f"FEEDER start | path={JSON_PATH} | rate={FEED_RATE_HZ} Hz "
+            f"DATA_FEEDER start | path={JSON_PATH} | rate={FEED_RATE_HZ} Hz "
             f"| increment={TS_INCREMENT_SEC}s"
         )
         for record in read_json_records(JSON_PATH):
@@ -304,7 +304,7 @@ def feeder_proc(train_data_q, fc_data_q, sim_done, gappsd_simid):
     train_data_q.put(DONE)
     fc_data_q.put(DONE)
     log.info(
-        f"FEEDER done | total={n_real} real + {n_imp} imputed "
+        f"DATA_FEEDER done | total={n_real} real + {n_imp} imputed "
         f"| last_ts={utc_str(last_ts) if last_ts else 'n/a'} | sent DONE"
     )
     train_data_q.cancel_join_thread()
