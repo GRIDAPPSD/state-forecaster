@@ -5,10 +5,10 @@ from datetime import datetime, timezone
 LOG_DIR = "./logs"
 
 # --- streaming cadence ---
-# TS_INCREMENT_SEC = 3        # timestamp spacing in the input stream (real-time)
-# TS_INCREMENT_SEC = 60       # timestamp spacing in the input stream (1 min)
+#TS_INCREMENT_SEC = 3        # timestamp spacing in the input stream (real-time)
+#TS_INCREMENT_SEC = 60       # timestamp spacing in the input stream (1 min)
 TS_INCREMENT_SEC = 300  # timestamp spacing in the input stream (5 min)
-# TS_INCREMENT_SEC = 900      # timestamp spacing in the input stream (15 min)
+#TS_INCREMENT_SEC = 900      # timestamp spacing in the input stream (15 min)
 
 DONE = "__DONE__"  # sentinel Queue item meaning "end of stream"
 
