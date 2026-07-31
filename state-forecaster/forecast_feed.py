@@ -10,7 +10,7 @@ from forecast_common import (
     DONE,
 )
 
-FEEDER_LOG = f"{LOG_DIR}/feeder.log"
+FEEDER_LOG = f"{LOG_DIR}/data_feeder.log"
 
 # JSON_PATH = "results_data_forecasting_13_1min.jsonl"
 JSON_PATH = "results_data_forecasting_13_5min.jsonl"
@@ -216,7 +216,7 @@ def make_imputer(increment_sec):
 # a shared emit() that enqueues the resulting burst to BOTH data queues.
 # =====================================================
 def feeder_proc(train_data_q, fc_data_q, sim_done, gappsd_simid):
-    log = setup_logger("feeder", FEEDER_LOG)
+    log = setup_logger("data feeder", FEEDER_LOG)
 
     # Per-record imputer step + cadence-guard (shared by whichever driver runs).
     step = make_imputer(TS_INCREMENT_SEC)
