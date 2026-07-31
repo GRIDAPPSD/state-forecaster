@@ -37,7 +37,7 @@ def main():
         mp.Process(
             target=feeder_proc,
             args=(train_data_q, fc_data_q, sim_done, gappsd_simid),
-            name="feeder",
+            name="data_feeder",
         ),
         mp.Process(
             target=trainer_proc,
