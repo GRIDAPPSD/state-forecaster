@@ -46,6 +46,7 @@ COMPUTE_LIVE_MAE = True  # deferred scoring: score one forecast per model
 # CONFIG (1-based step indices into the FUT-step horizon; None disables per-step MAE)
 COMPUTE_MAE_STEPS = [1, 8, 15]
 
+
 def build_forecast_json(
     preds, nids, base_ts, buf, base_time=None, simulation_id=None
 ):
@@ -295,6 +296,7 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
     current_version = 0
     pending_snap = None
     data_done = False
+    model_done = False  # sticky end-of-model-stream flag (parallels data_done)
     fc_count = 0
     warmup_logged = False
 
@@ -304,9 +306,9 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
     #  "abs_v": [...], "abs_a": [...], "n": 0, "version": int}
 
     if COMPUTE_MAE_STEPS is not None:
-        assert all(1 <= s <= FUT for s in COMPUTE_MAE_STEPS), (
-            f"COMPUTE_MAE_STEPS {COMPUTE_MAE_STEPS} has values outside 1..FUT={FUT}"
-        )
+        assert all(
+            1 <= s <= FUT for s in COMPUTE_MAE_STEPS
+        ), f"COMPUTE_MAE_STEPS {COMPUTE_MAE_STEPS} has values outside 1..FUT={FUT}"
 
     # Forecast-output file: truncate any existing file at startup, then append
     # one JSON line per published forecast (open/append/close per write --
@@ -328,9 +330,10 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
         if ts not in pending["remaining"]:
             return
         pred_at = pending["pred"][ts]
-        step = pending["ts_to_step"][ts]                       # NEW: 1-based step
-        track_step = (COMPUTE_MAE_STEPS is not None
-                      and step in pending["step_v"])           # NEW
+        step = pending["ts_to_step"][ts]  # NEW: 1-based step
+        track_step = (
+            COMPUTE_MAE_STEPS is not None and step in pending["step_v"]
+        )  # NEW
         for node, vals in record["nodes"].items():
             p = pred_at.get(node)
             if p is None:
@@ -340,10 +343,10 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
             pending["abs_v"] += dv
             pending["abs_a"] += da
             pending["n"] += 1
-            if track_step:                                      # NEW
-                pending["step_v"][step] += dv                   # NEW
-                pending["step_a"][step] += da                   # NEW
-                pending["step_n"][step] += 1                    # NEW
+            if track_step:  # NEW
+                pending["step_v"][step] += dv  # NEW
+                pending["step_a"][step] += da  # NEW
+                pending["step_n"][step] += 1  # NEW
         pending["remaining"].discard(ts)
         if not pending["remaining"]:  # all horizon steps collected
             n = max(pending["n"], 1)
@@ -354,7 +357,7 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
                 f"Angle MAE (rad): {pending['abs_a']/n:.6f} "
                 f"({pending['n']} node-steps)"
             )
-            if COMPUTE_MAE_STEPS is not None:                   # NEW: per-step line
+            if COMPUTE_MAE_STEPS is not None:  # NEW: per-step line
                 parts = []
                 for s in COMPUTE_MAE_STEPS:
                     sn = max(pending["step_n"][s], 1)
@@ -393,6 +396,8 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
     while True:
         # 1) MODEL QUEUE FIRST: adopt newest snapshot (weights + scalers), honor DONE.
         snap, model_saw_done = drain_latest(model_q)
+        if model_saw_done:
+            model_done = True  # NEW: latch it, like data_done
         if snap is not None:
             if buf is None:
                 pending_snap = (
@@ -490,7 +495,7 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
 
                     if COMPUTE_LIVE_MAE and score_armed:
                         pred = {}
-                        ts_to_step = {}   # forecast_time -> 1-based step index
+                        ts_to_step = {}  # forecast_time -> 1-based step index
                         for k in range(FUT):
                             ft = fc_json["Forecast"]["forecast_times"][k]
                             pred[ft] = {
@@ -499,7 +504,7 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
                                     "nodes"
                                 ].items()
                             }
-                            ts_to_step[ft] = k + 1   # 1-based
+                            ts_to_step[ft] = k + 1  # 1-based
                         pending = {
                             "remaining": set(pred.keys()),
                             "pred": pred,
@@ -508,11 +513,17 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
                             "n": 0,
                             "version": current_version,
                             "base_time": latest_ts,
-                            "ts_to_step": ts_to_step,                      # NEW
+                            "ts_to_step": ts_to_step,  # NEW
                             # per-step accumulators for the requested steps:
-                            "step_v": {s: 0.0 for s in (COMPUTE_MAE_STEPS or [])},   # NEW
-                            "step_a": {s: 0.0 for s in (COMPUTE_MAE_STEPS or [])},   # NEW
-                            "step_n": {s: 0 for s in (COMPUTE_MAE_STEPS or [])},     # NEW
+                            "step_v": {
+                                s: 0.0 for s in (COMPUTE_MAE_STEPS or [])
+                            },  # NEW
+                            "step_a": {
+                                s: 0.0 for s in (COMPUTE_MAE_STEPS or [])
+                            },  # NEW
+                            "step_n": {
+                                s: 0 for s in (COMPUTE_MAE_STEPS or [])
+                            },  # NEW
                         }
                         score_armed = False
                         log.info(
@@ -529,7 +540,7 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
                     warmup_logged = True
 
         # 4) shutdown when BOTH streams exhausted.
-        if data_done and model_saw_done:
+        if data_done and model_done:  # both sticky now
             log.info(
                 f"FORECASTER received DONE on both queues → exit "
                 f"(total forecasts: {fc_count}, final model v{current_version})"
