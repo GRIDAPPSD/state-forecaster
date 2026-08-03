@@ -21,7 +21,7 @@ LOG_DIR = "./logs"
 # into the day/week lag intervals. Uncomment the value matching the run:
 # TS_INCREMENT_SEC = 3     # real-time simulation cadence
 # TS_INCREMENT_SEC = 60    # 1-minute increment
-TS_INCREMENT_SEC = 300     # 5-minute increment
+TS_INCREMENT_SEC = 300  # 5-minute increment
 # TS_INCREMENT_SEC = 900   # 15-minute increment
 
 # Sentinel value placed on inter-process queues to signal end-of-stream.

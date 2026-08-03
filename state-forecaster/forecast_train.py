@@ -39,10 +39,10 @@ TRAINER_LOG = f"{LOG_DIR}/trainer.log"
 BLOCK_DAYS = 2  # training block size ("2-day window")
 BLOCK_SEC = BLOCK_DAYS * 24 * 3600
 
-EPOCHS_PER_BLOCK = 8       # max epochs per block (early stopping may cut short)
+EPOCHS_PER_BLOCK = 8  # max epochs per block (early stopping may cut short)
 BATCH_SIZE = 512
-NUM_WORKERS = 0           # DataLoader workers; 0 = load in the main process
-VAL_FRACTION = 0.05       # fraction of a block's samples held out for validation
+NUM_WORKERS = 0  # DataLoader workers; 0 = load in the main process
+VAL_FRACTION = 0.05  # fraction of a block's samples held out for validation
 
 PIN_MEMORY = DEVICE == "cuda"  # pinned memory speeds host->GPU copies
 

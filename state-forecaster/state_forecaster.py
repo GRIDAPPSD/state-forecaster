@@ -110,9 +110,7 @@ def main():
         # Report any non-zero exit codes (a crashed child surfaces here).
         for p in procs:
             if p.exitcode not in (0, None):
-                print(
-                    f"[MAIN] WARNING: {p.name} exited with code {p.exitcode}"
-                )
+                print(f"[MAIN] WARNING: {p.name} exited with code {p.exitcode}")
 
 
 if __name__ == "__main__":

@@ -246,7 +246,8 @@ class RunningStandardizer:
 
 def extract_scaler_state(buf):
     """Snapshot the four scalers' state as plain picklable numbers, for
-    inclusion in a model snapshot (trainer side). Paired with apply_scaler_state."""
+    inclusion in a model snapshot (trainer side). Paired with apply_scaler_state.
+    """
     return {
         "P": (buf.sc_P.min, buf.sc_P.max),
         "Q": (buf.sc_Q.min, buf.sc_Q.max),
@@ -257,7 +258,8 @@ def extract_scaler_state(buf):
 
 def apply_scaler_state(buf, state):
     """Restore scaler state (from extract_scaler_state) into a buffer's scalers
-    (forecaster side), so the forecaster normalizes exactly as the trainer did."""
+    (forecaster side), so the forecaster normalizes exactly as the trainer did.
+    """
     buf.sc_P.min, buf.sc_P.max = state["P"]
     buf.sc_Q.min, buf.sc_Q.max = state["Q"]
     buf.sc_V.min, buf.sc_V.max = state["V"]
@@ -292,7 +294,9 @@ class RollingBuffer:
             for nid, n in self.id_to_node.items()
         }
         # rebuilt each block by rebuild_normalized():
-        self.tensors = {}  # nid -> float32 [T,6]: V,ang,P,Q,sin,cos (normalized)
+        self.tensors = (
+            {}
+        )  # nid -> float32 [T,6]: V,ang,P,Q,sin,cos (normalized)
         self.pos_by_ts = {}  # nid -> {ts: row index}
         self.newest_ts = None
         # incremental scalers (V/P/Q min-max, angle standardized)
@@ -375,7 +379,8 @@ class RollingBuffer:
 
     def build_training_indices(self):
         """All valid (nid, position, ts) samples across the retained buffer,
-        subsampled to MAX_WINDOW_SAMPLES if exceeded (bounds train time/memory)."""
+        subsampled to MAX_WINDOW_SAMPLES if exceeded (bounds train time/memory).
+        """
         idx = []
         for nid in range(self.num_nodes):
             if nid not in self.tensors:

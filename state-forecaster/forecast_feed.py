@@ -297,7 +297,9 @@ def feeder_proc(train_data_q, fc_data_q, sim_done, gappsd_simid):
             else:
                 n_real += 1
                 last_ts = int(out_rec["timestamp"])
-                if n_real % 60 == 0:  # progress heartbeat (~hourly at 5-min data)
+                if (
+                    n_real % 60 == 0
+                ):  # progress heartbeat for every 60 real records
                     log.info(
                         f"fed {n_real} real (+{n_imp} imputed) "
                         f"| latest_ts={utc_str(last_ts)}"

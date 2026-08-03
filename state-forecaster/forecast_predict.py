@@ -362,7 +362,9 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
 
     # --- deferred live MAE scoring state ---
     score_armed = False  # set on snapshot adoption; scores the NEXT forecast
-    pending = None  # the one forecast currently being scored (see score_pending)
+    pending = (
+        None  # the one forecast currently being scored (see score_pending)
+    )
 
     if COMPUTE_MAE_STEPS is not None:
         assert all(
@@ -391,9 +393,7 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
             return
         pred_at = pending["pred"][ts]
         step = pending["ts_to_step"][ts]  # 1-based horizon step of this ts
-        track_step = (
-            COMPUTE_MAE_STEPS is not None and step in pending["step_v"]
-        )
+        track_step = COMPUTE_MAE_STEPS is not None and step in pending["step_v"]
         for node, vals in record["nodes"].items():
             p = pred_at.get(node)
             if p is None:
@@ -580,8 +580,12 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
                             "base_time": latest_ts,
                             "ts_to_step": ts_to_step,
                             # per-step accumulators for the requested steps:
-                            "step_v": {s: 0.0 for s in (COMPUTE_MAE_STEPS or [])},
-                            "step_a": {s: 0.0 for s in (COMPUTE_MAE_STEPS or [])},
+                            "step_v": {
+                                s: 0.0 for s in (COMPUTE_MAE_STEPS or [])
+                            },
+                            "step_a": {
+                                s: 0.0 for s in (COMPUTE_MAE_STEPS or [])
+                            },
                             "step_n": {s: 0 for s in (COMPUTE_MAE_STEPS or [])},
                         }
                         score_armed = False
