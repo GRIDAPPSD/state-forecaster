@@ -60,7 +60,9 @@ class ReplayDataset(Dataset):
 
     def __init__(self, indices, buf):
         self.indices = indices
-        self.buf__(self):
+        self.buf = buf
+
+    def __len__(self):
         return len(self.indices)
 
     def __getitem__(self, idx):
