@@ -1,4 +1,20 @@
 #!/usr/bin/python3
+"""
+state_forecaster.py — Entry point / launcher for the State Forecaster app.
+
+Spawns and wires together the three worker processes that make up the app:
+
+    data_feeder : reads state estimates (GridAPPS-D bus or file), imputes gaps,
+                  and distributes each record to the trainer and forecaster.
+    trainer     : accumulates 2-day blocks, trains the DNN, publishes model
+                  snapshots to the forecaster.
+    forecaster  : ingests estimates, forecasts the latest timestamp using the
+                  newest model snapshot, publishes/records forecasts.
+
+The processes communicate only through the queues and the sim_done Event
+created here; they share no other state. Invoked with an optional GridAPPS-D
+simulation ID (bus mode); with no argument it runs in file mode.
+"""
 
 import sys
 
@@ -13,21 +29,30 @@ from forecast_predict import forecaster_proc
 # MAIN — spawn the three processes, wire the queues.
 # =====================================================
 def main():
-    # GDB 7/20/26: GridAPPS-D simulation ID is first command line argument
+    """Create the shared queues/Event, spawn the three worker processes, and
+    manage their lifecycle (normal join, Ctrl-C teardown, exit-code report)."""
+    # GDB 7/20/26: GridAPPS-D simulation ID is first command line argument.
+    # Present -> bus mode (subscribe to that simulation); absent -> file mode.
     gappsd_simid = None
     if len(sys.argv) > 1:
         gappsd_simid = sys.argv[1]
 
-    mp.set_start_method(
-        "spawn", force=True
-    )  # required for CUDA + multiprocessing
+    # "spawn" (not fork) is required for CUDA + multiprocessing: each child
+    # initializes its own CUDA context cleanly.
+    mp.set_start_method("spawn", force=True)
 
-    # --- Queues ---
-    # Trainer data: keep-ALL FIFO (unbounded). Every record must be retained
-    #   so the trainer's RollingBuffer has no gaps.
-    # Forecaster data: keep-ALL FIFO (unbounded). Every record must be retained
-    # Model: trainer PUTs snapshots; forecaster GETs. Latest-only via
-    #   drain_latest on the consumer side (unbounded; snapshots are infrequent).
+    # --- Queues + end-of-simulation Event ---
+    # train_data_q : feeder -> trainer.   Keep-ALL FIFO so the trainer's
+    #                RollingBuffer sees a gapless history (no dropped records).
+    # fc_data_q    : feeder -> forecaster. Keep-ALL FIFO too (gapless history);
+    #                the forecaster forec but must ingest
+    #                every record to keep its recent-history window contiguous.
+    # model_q      : trainer PUTs model snapshots; forecaster GETs them.
+    #                Consumer takes latest-only via drain_latest (snapshots are
+    #                infrequent, so an unbounded queue stays shallow).
+    # sim_done     : one-shot Event the feeder sets at end-of-stream so the
+    #                trainer can stop promptly (rather than draining/training
+    #                queued blocks no forecaster will consume).
     train_data_q = mp.Queue()
     fc_data_q = mp.Queue()
     model_q = mp.Queue()
@@ -57,8 +82,9 @@ def main():
         p.start()
 
     try:
-        # Normal shutdown: feeder finishes → sends DONE → trainer finalizes and
-        # sends DONE to model queue → forecaster sees DONE on both → all exit.
+        # Normal shutdown chain: feeder finishes -> sends DONE (+ sets sim_done)
+        # -> trainer finalizes and sends DONE to the model queue -> forecaster
+        # sees DONE on both its queues -> all three exit -> the joins return.
         for p in procs:
             p.join()
         bad = [p for p in procs if p.exitcode not in (0, None)]
@@ -71,7 +97,7 @@ def main():
             print("[MAIN] all processes exited cleanly.")
 
     except KeyboardInterrupt:
-        # Ctrl-C: tear down children so we don't leave orphans.
+        # Ctrl-C: terminate children so we don't leave orphaned processes.
         print("\n[MAIN] KeyboardInterrupt → terminating child processes...")
         for p in procs:
             if p.is_alive():
@@ -81,10 +107,12 @@ def main():
         print("[MAIN] shutdown complete.")
 
     finally:
-        # Report any non-zero exit codes (a crashed child shows up here).
+        # Report any non-zero exit codes (a crashed child surfaces here).
         for p in procs:
             if p.exitcode not in (0, None):
-                print(f"[MAIN] WARNING: {p.name} exited with code {p.exitcode}")
+                print(
+                    f"[MAIN] WARNING: {p.name} exited with code {p.exitcode}"
+                )
 
 
 if __name__ == "__main__":

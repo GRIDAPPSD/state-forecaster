@@ -1,3 +1,22 @@
+"""
+forecast_feed.py — Data-feeder process for the State Forecaster.
+
+Torch-free: this module knows nothing about neural networks. Its sole job is to
+be the single data source for the app — read state estimates from either the
+GridAPPS-D message bus or a .jsonl file, fill any timestamp gaps by
+interpolation, and hand each record to the trainer and forecaster processes via
+their queues.
+
+Key pieces:
+  * Parse helpers (_pq_value, parse_sv_entry, sv_entries_to_nodes,
+    read_json_records) — the single source of truth for turning a State
+    Estimator "SvEstVoltages" entry into the app's internal record shape.
+  * make_imputer — a stateful per-record step that backfills missing
+    grid-aligned timestamps and performs a one-time cadence sanity check.
+  * feeder_proc — the process entry point; selects bus vs. file source and
+    funnels every record through a shared emit() to both data queues.
+"""
+
 import os
 import time
 import json
@@ -12,18 +31,26 @@ from forecast_common import (
 
 FEEDER_LOG = f"{LOG_DIR}/data_feeder.log"
 
+# Input file for FILE-DRIVER mode (used when no GridAPPS-D sim id is given).
+# Uncomment the one matching the model / increment being tested;UST match TS_INCREMENT_SEC (the startup cadence check will complain if not).
 # JSON_PATH = "results_data_forecasting_13_1min.jsonl"
 JSON_PATH = "results_data_forecasting_13_5min.jsonl"
 # JSON_PATH = "results_data_forecasting_13_15min.jsonl"
 # JSON_PATH = "results_data_forecasting_123_5min.jsonl"
 
-# FEED_RATE_HZ = 1.0          # records/sec the feeder emits (real ~1; >1 speeds testing)
-# FEED_RATE_HZ = 4.0          # records/sec the feeder emits (real ~1; >1 speeds testing)
-FEED_RATE_HZ = 50.0  # records/sec the feeder emits (real ~1; >1 speeds testing)
+# FILE-DRIVER pacing: records/sec the feeder emits. Real estimates arrive ~1/s;
+# rates >1 just speed up file-based testing. (Bus driver is not paced — it
+# emits as messages arrive.) Note: very high rates make data arrive faster than
+# training can consume it, so a run may finish before much forecasting occurs.
+# FEED_RATE_HZ = 1.0
+# FEED_RATE_HZ = 4.0
+FEED_RATE_HZ = 50.0
 
-FEEDER_POLL_SEC = 0.05  # feeder idle poll interval
+FEEDER_POLL_SEC = 0.05  # bus-driver idle sleep while waiting for messages
 
-CADENCE_CHECK_SAMPLES = 20  # records to sample for the startup cadence check
+# Number of initial real records whose spacing is sampled to infer the true
+# data cadence for the startup cadence check (see make_imputer).
+CADENCE_CHECK_SAMPLES = 20
 
 
 def _pq_value(x):
@@ -40,8 +67,8 @@ def parse_sv_entry(entry):
     Single source of truth for entry interpretation, shared by the bus callback
     and the file reader. Node key = ConnectivityNode + "." + phase;
     phase used as-is, empty phase falls back to bare ConnectivityNode. vpu -> V
-    (per-unit), ang (radians); P/Q "NA" -> 0.0. V/Angle not
-    NA-coerced (missing voltage/angle should fail loudly)."""
+    (per-unit), angleRad -> Angle (radians); P/Q "NA" -> 0.0. V/Angle are NOT
+    NA-coerced (a missing voltage/angle should fail loudly, not be zeroed)."""
     cn = entry["ConnectivityNode"]
     phase = entry["phase"]
     node_key = f"{cn}.{phase}" if phase != "" else cn
@@ -55,7 +82,8 @@ def parse_sv_entry(entry):
 
 
 def sv_entries_to_nodes(sv_entries):
-    """Build the internal {node_key: {P,Q,V,Angle}} dict from a SvEstVoltages list."""
+    """Build the internal {node_key: {P,Q,V,Angle}} dict from a SvEstVoltages
+    list (applies parse_sv_entry to each entry)."""
     nodes = {}
     for entry in sv_entries:
         node_key, node_vals = parse_sv_entry(entry)
@@ -65,7 +93,8 @@ def sv_entries_to_nodes(sv_entries):
 
 def read_json_records(path):
     """Yield one internal record per line from the SE-written .jsonl file.
-    (Envelope: {"timeStamp": ..., "SvEstVoltages": [...]}.)"""
+    File envelope per line: {"timeStamp": ..., "SvEstVoltages": [...]}.
+    Yields the app's internal shape: {"timestamp", "nodes": {...}}."""
     with open(path, "r") as f:
         for line in f:
             line = line.strip()
@@ -79,9 +108,9 @@ def read_json_records(path):
 
 def _emit_cadence_warning(min_delta, increment_sec):
     """Loud, hard-to-miss warning when the detected data cadence doesn't match
-    the configured TS_INCREMENT_SEC. Printed once. Goes to stdout (thech
+    the configured TS_INCREMENT_SEC. Printed once, to stdout (the shared
     console in multi-process), so it surfaces prominently rather than being
-    buried."""
+    buried in a log file."""
     bar = "*" * 72
     print("\n" + bar)
     print(
@@ -124,10 +153,12 @@ def make_imputer(increment_sec):
     """
     prev_ts = None
     prev_nodes = None
+    # Cadence-check state: track the minimum spacing seen over the first several
+    # real records; the smallest gap is the true cadence (gaps only enlarge it).
     cad_min_delta = None
     cad_count = 0
     cad_warned = False
-    cad_mismatch = False
+    cad_mismatch = False  # True if cadence mismatched -> suppress per-gap spam
 
     def step(record):
         nonlocal prev_ts, prev_nodes
@@ -139,7 +170,7 @@ def make_imputer(increment_sec):
         if prev_ts is not None:
             delta = ts - prev_ts
 
-            # --- cadence check on raw spacing (before imputation) ---
+            # --- one-time cadence check on raw spacing (before imputation) ---
             if not cad_warned and delta > 0:
                 cad_min_delta = (
                     delta
@@ -147,7 +178,9 @@ def make_imputer(increment_sec):
                     else min(cad_min_delta, delta)
                 )
                 cad_count += 1
-                # conclude early on definitive evidence, else at the sample budget
+                # Conclude early on definitive evidence (a gap smaller than the
+                # configured increment can't be explained away), else once we've
+                # sampled enough records to trust the minimum as the true cadence.
                 if (
                     cad_min_delta < increment_sec
                     or cad_count >= CADENCE_CHECK_SAMPLES
@@ -158,11 +191,16 @@ def make_imputer(increment_sec):
                     cad_warned = True
 
             if delta <= 0:
+                # Non-increasing timestamps violate the stream's assumptions;
+                # pass the record through unchanged rather than impute backward.
                 print(
                     f"[IMPUTE] WARNING: non-increasing timestamp "
                     f"{prev_ts} -> {ts}; passing through without imputation."
                 )
             elif delta % increment_sec != 0:
+                # Gap isn't a whole number of increments -> can't place imputed
+                # records on the grid. Warn once per gap, unless we've already
+                # reported a cadence mismatch (which would spam every record).
                 if not cad_mismatch:
                     print(
                         f"[IMPUTE] WARNING: gap {delta}s not a multiple of "
@@ -170,6 +208,8 @@ def make_imputer(increment_sec):
                         f"no imputation for this gap."
                     )
             else:
+                # Normal case: gap is N increments. If N > 1, synthesize the
+                # N-1 missing grid points by linear interpolation per node.
                 gap_steps = delta // increment_sec
                 if gap_steps > 1:
                     for k in range(1, gap_steps):
@@ -179,6 +219,8 @@ def make_imputer(increment_sec):
                         for node_name, cur_vals in record["nodes"].items():
                             pv = prev_nodes.get(node_name)
                             if pv is None:
+                                # Node absent in the previous record: can't
+                                # interpolate, so copy current values as-is.
                                 imp_nodes[node_name] = dict(cur_vals)
                             else:
                                 imp_nodes[node_name] = {
@@ -216,12 +258,26 @@ def make_imputer(increment_sec):
 # a shared emit() that enqueues the resulting burst to BOTH data queues.
 # =====================================================
 def feeder_proc(train_data_q, fc_data_q, sim_done, gappsd_simid):
+    """Data-feeder process entry point.
+
+    Reads state estimates from the GridAPPS-D bus (if gappsd_simid is given) or
+    from a .jsonl file (otherwise), runs each through the imputer, and enqueues
+    the results to the trainer and forecaster data queues. On end-of-stream,
+    sets the sim_done Event, sends the DONE sentinel to both queues, and
+    releases the queues' background threads so the process can exit cleanly.
+
+    Args:
+        train_data_q: queue to the trainer (keep-all).
+        fc_data_q:    queue to the forecaster (keep-all).
+        sim_done:     shared Event set at end-of-stream (trainer's stop signal).
+        gappsd_simid: GridAPPS-D simulation id -> bus mode; None -> file mode.
+    """
     log = setup_logger("data_feeder", FEEDER_LOG)
 
     # Per-record imputer step + cadence-guard (shared by whichever driver runs).
     step = make_imputer(TS_INCREMENT_SEC)
 
-    # counters (shared)
+    # Emitted-record counters (shared across emit() calls via closure).
     n_real = 0
     n_imp = 0
     last_ts = None
@@ -229,7 +285,8 @@ def feeder_proc(train_data_q, fc_data_q, sim_done, gappsd_simid):
     def emit(record, pace=False):
         """Run one record through the imputer and enqueue the resulting burst
         (imputed records + the real one) onto both queues. Imputed records go
-        out back-to-back; optional pacing applies once, after the real record.
+        out back-to-back; optional pacing sleeps once, after the real record
+        (file driver only — simulates realistic arrival spacing).
         """
         nonlocal n_real, n_imp, last_ts
         for out_rec in step(record):
@@ -240,19 +297,21 @@ def feeder_proc(train_data_q, fc_data_q, sim_done, gappsd_simid):
             else:
                 n_real += 1
                 last_ts = int(out_rec["timestamp"])
-                # if n_real % 500 == 0:
-                if n_real % 60 == 0:
+                if n_real % 60 == 0:  # progress heartbeat (~hourly at 5-min data)
                     log.info(
                         f"fed {n_real} real (+{n_imp} imputed) "
                         f"| latest_ts={utc_str(last_ts)}"
                     )
         if pace and FEED_RATE_HZ > 0:
-            time.sleep(
-                1.0 / FEED_RATE_HZ
-            )  # pace only on real estimates (file driver)
+            # Pace only on the real estimate (imputed records in a burst go out
+            # immediately); throttles the file driver to a realistic rate.
+            time.sleep(1.0 / FEED_RATE_HZ)
 
     if gappsd_simid is not None:
         # ---------- BUS DRIVER (GridAPPS-D) ----------
+        # Subscribe to the State Estimator's output; each arriving message is
+        # unwrapped and pushed through emit(). The process stays alive in a
+        # poll loop until a processStatus=COMPLETE message ends the stream.
         from gridappsd import GridAPPSD
         from gridappsd.topics import service_output_topic
 
@@ -264,17 +323,21 @@ def feeder_proc(train_data_q, fc_data_q, sim_done, gappsd_simid):
         keepLoopingFlag = True
 
         def estimateCallback(header, message):
+            """Bus subscription callback (fires per incoming message on the
+            gridappsd listener thread). Handles the COMPLETE end-of-stream
+            signal, or unwraps an estimate message and emits its record."""
             nonlocal keepLoopingFlag
             if "processStatus" in message:
                 if message["processStatus"] == "COMPLETE":
                     log.info("Got processStatus COMPLETE message")
                     keepLoopingFlag = False
                 return
-            # unwrap: message -> message -> Estimate -> SvEstVoltages
+            # Unwrap the 3-level envelope: message -> message -> Estimate,
+            # then take timeStamp + SvEstVoltages from the Estimate structure
+            # (the same structure the SE writes to the .jsonl file).
             est = message["message"]["Estimate"]
             ts = int(est["timeStamp"])
             nodes = sv_entries_to_nodes(est["SvEstVoltages"])
-            # build internal record: {"timestamp", "nodes": {key: {P,Q,V,Angle}}}
             emit({"timestamp": ts, "nodes": nodes})  # no pacing on bus
 
         gapps = GridAPPSD(gappsd_simid)
@@ -288,11 +351,14 @@ def feeder_proc(train_data_q, fc_data_q, sim_done, gappsd_simid):
             f"| increment={TS_INCREMENT_SEC}s"
         )
 
+        # Callback runs on the listener thread; idle here until COMPLETE.
         while keepLoopingFlag:
             time.sleep(FEEDER_POLL_SEC)
 
     else:
         # ---------- FILE DRIVER ----------
+        # Read the .jsonl straight through, pacing each real record so data
+        # doesn't outrun the trainer/forecaster (see FEED_RATE_HZ).
         log.info(
             f"DATA_FEEDER start | path={JSON_PATH} | rate={FEED_RATE_HZ} Hz "
             f"| increment={TS_INCREMENT_SEC}s"
@@ -300,6 +366,11 @@ def feeder_proc(train_data_q, fc_data_q, sim_done, gappsd_simid):
         for record in read_json_records(JSON_PATH):
             emit(record, pace=True)
 
+    # --- end-of-stream shutdown (both drivers converge here) ---
+    # Set sim_done FIRST so the trainer's stop signal is live before DONE lands
+    # on the queues, then send DONE to both consumers. cancel_join_thread lets
+    # this process exit without blocking on any records the consumers haven't
+    # drained (they honor DONE and abandon the rest).
     sim_done.set()
     train_data_q.put(DONE)
     fc_data_q.put(DONE)

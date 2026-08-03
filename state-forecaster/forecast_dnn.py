@@ -1,3 +1,22 @@
+"""
+forecast_dnn.py — Shared deep-neural-network core for the State Forecaster.
+
+The torch-dependent heart of the app, imported by BOTH the trainer and the
+forecaster (they share the model, the rolling buffer, the scalers, and the
+input-vector layout). Keeping this in one module guarantees train and predict
+build model inputs identically and agree on all model/normalization details.
+
+Contents:
+  * Model + feature config (HIST/FUT, lag intervals, retention horizon,
+    device/seed setup).
+  * time_features / encode_phase / assemble_input_vector (+ INPUT_DIM/OUTPUT_DIM)
+    — the input-vector construction (single source of truth for the layout).
+  * RunningMinMax / RunningStandardizer — streaming (incremental) scalers, plus
+    extract/apply helpers to move their state across the process boundary.
+  * RollingBuffer — per-node raw history + normalized tensors + sample indexing.
+  * DNN / build_model — the network and its optimizer/scheduler/loss/AMP scaler.
+"""
+
 import math
 import numpy as np
 
@@ -8,27 +27,16 @@ import torch
 import torch.nn as nn
 
 DROPOUT_P = 0.03  # training regularization only (no MC dropout)
-MAX_WINDOW_SAMPLES = 500_000  # cap: bounds per-block memory AND train time.
+MAX_WINDOW_SAMPLES = 500_000  # cap on per-block training samples: bounds both
+#                               memory and training time (subsample above this)
 
-# --- history / horizon (in SAMPLES, i.e. timestamps) ---
-HIST = 15  # past samples used as input (15 min @ 1-min)
-FUT = 15  # future samples to forecast (15 min @ 1-min)
+# --- history / horizon (in SAMPLES, i.e. number of timestamps) ---
+# Actual time spans scale with TS_INCREMENT_SEC: e.g. HIST=15 is 15 min at a
+# 1-min increment, 75 min at a 5-min increment.
+HIST = 15  # past samples used as model input
+FUT = 15  # future samples to forecast
 
-INPUT_DIM = (
-    HIST * 2  # historical V, angle
-    + 2  # current or previous P,Q
-    + 2  # 1-day lag P,Q
-    + 2  # 1-day lag V, angle
-    + 1  # 1-day lag availability flag
-    + 2  # 1-week lag P,Q
-    + 2  # 1-week lag V, angle
-    + 1  # 1-week lag availability flag
-    + 3  # phase
-    + 2  # sin_time, cos_time
-)
-OUTPUT_DIM = FUT * 2
-
-# --- lag features (in TIME, converted to seconds) ---
+# --- lag features (in TIME, seconds) — looked up by timestamp, not position ---
 DAY_LAG_SEC = 1 * 24 * 3600  # 1-day lag
 WEEK_LAG_SEC = 7 * 24 * 3600  # 1-week lag
 
@@ -43,8 +51,11 @@ RETENTION_DAYS = 10  # rolling buffer horizon (see rationale below)
 #   All heuristics; kept configurable for later evaluation.
 RETENTION_SEC = RETENTION_DAYS * 24 * 3600
 
+# Use the injection P,Q at the base (current) row as input; if False, use t-1.
 USE_CURRENT_PQ = True
 
+# Fixed seed for reproducibility. NOTE: with the "spawn" start method each child
+# process re-imports this module and re-seeds independently.
 SEED = 42
 np.random.seed(SEED)
 torch.manual_seed(SEED)
@@ -57,8 +68,9 @@ DEVICE = "cuda" if torch.cuda.is_available() and USE_GPU else "cpu"
 # TIME FEATURES (from epoch seconds; no pandas)
 # =====================================================
 def time_features(epoch_sec):
-    """Return (sin_time, cos_time) for minute-of-day, matching the CSV pipeline
-    which used UTC-naive timestamps derived from unix seconds."""
+    """Return (sin_time, cos_time) encoding minute-of-day cyclically.
+    Cyclic encoding so 23:59 and 00:00 are adjacent in feature space. UTC to
+    match the original (pandas-based) pipeline's timestamp handling."""
     dt = datetime.fromtimestamp(epoch_sec, tz=timezone.utc)
     minute_of_day = dt.hour * 60 + dt.minute
     ang = 2.0 * math.pi * minute_of_day / 1440.0
@@ -66,6 +78,10 @@ def time_features(epoch_sec):
 
 
 def encode_phase(load_node):
+    """Return a 3-element one-hot phase vector from a node name's last char.
+    Handles both letter (a/b/c) and numeric (1/2/3) phase suffixes, mapping
+    each to the same one-hot. Unknown/other -> all zeros. (Single-character
+    phase only; multi-char phases like 's1' are out of scope.)"""
     s = str(load_node).lower()
     p = s[-1]
     return {
@@ -78,16 +94,41 @@ def encode_phase(load_node):
     }.get(p, np.zeros(3, dtype=np.float32))
 
 
+# Model input/output dimensions. INPUT_DIM's per-line breakdown below MUST stay
+# in sync with the concatenation order in assemble_input_vector (kept adjacent
+# here on purpose so the two can't drift). Depends on HIST/FUT (defined above).
+INPUT_DIM = (
+    HIST * 2  # historical V, angle
+    + 2  # current or previous P,Q
+    + 2  # 1-day lag P,Q
+    + 2  # 1-day lag V, angle
+    + 1  # 1-day lag availability flag
+    + 2  # 1-week lag P,Q
+    + 2  # 1-week lag V, angle
+    + 1  # 1-week lag availability flag
+    + 3  # phase (one-hot)
+    + 2  # sin_time, cos_time
+)
+OUTPUT_DIM = FUT * 2  # forecast V + angle for each of FUT future steps
+
+
 def assemble_input_vector(
     hist_va, base_pq, day_row, week_row, phase, time_feat
 ):
     """Single source of truth for the model input layout.
-    Used identically by the trainer (ReplayDataset) and the forecaster.
+    Used identically by the trainer (ReplayDataset) and the forecaster
+    (forecast_latest), guaranteeing both build inputs the same way. The
+    concatenation order below mirrors the INPUT_DIM breakdown just above.
+
+    For each lag row: if present, contribute its P,Q and V,angle plus an
+    availability flag of 1; if None (that lagged timestamp isn't in the buffer),
+    contribute zeros and a flag of 0 — so the model can distinguish "real lag
+    data" from "lag unavailable".
 
     Args (all torch.float32):
-        hist_va  : [HIST*2] flattened V,ang of the HIST rows before base (position-based)
+        hist_va  : [HIST*2] flattened V,ang of the HIST rows before base
         base_pq  : [2] P,Q of the base row (t if USE_CURRENT_PQ else t-1)
-        day_row  : [6] normalized row (V,ang,P,Q,sin,cos) at the 1-day lag, or None
+        day_row  : [6] normalized row (V,ang,P,Q,sin,cos) at 1-day lag, or None
         week_row : [6] normalized row at the 1-week lag, or None
         phase    : [3] phase one-hot
         time_feat: [2] sin_time, cos_time of the base row
@@ -129,11 +170,12 @@ def assemble_input_vector(
 
 
 # =====================================================
-# INCREMENTAL SCALERS (replace sklearn MinMax/StandardScaler)
-# Updated per-block with that block's raw values, causally.
+# INCREMENTAL SCALERS (streaming replacements for sklearn scalers)
+# Updated per-block with that block's raw values, causally (no peeking ahead).
 # =====================================================
 class RunningMinMax:
-    """Streaming MinMaxScaler for a single feature. Maps to [0, 1]."""
+    """Streaming MinMax scaler for a single feature; maps values to [0, 1].
+    Used for P, Q, and V. Tracks running min/max as blocks arrive."""
 
     def __init__(self):
         self.min = math.inf
@@ -152,6 +194,7 @@ class RunningMinMax:
     def transform(self, x):
         rng = self.max - self.min
         if rng == 0 or not math.isfinite(rng):
+            # Degenerate range (no data yet, or all-equal): map to zeros.
             return np.zeros_like(x, dtype=np.float64)
         return (x - self.min) / rng
 
@@ -161,7 +204,9 @@ class RunningMinMax:
 
 
 class RunningStandardizer:
-    """Streaming StandardScaler via Welford/Chan parallel variance."""
+    """Streaming standard scaler (zero mean / unit std) for a single feature,
+    used for angle. Maintains running mean/variance via Welford/Chan's parallel
+    algorithm so per-block updates match a single-pass fit over all data."""
 
     def __init__(self):
         self.n = 0
@@ -178,6 +223,7 @@ class RunningStandardizer:
         if self.n == 0:
             self.n, self.mean, self.M2 = nb, mb, M2b
             return
+        # Chan's parallel merge of the running stats with this batch's stats.
         delta = mb - self.mean
         tot = self.n + nb
         self.mean += delta * nb / tot
@@ -199,7 +245,8 @@ class RunningStandardizer:
 
 
 def extract_scaler_state(buf):
-    """Snapshot the four incremental scalers' state (plain picklable numbers)."""
+    """Snapshot the four scalers' state as plain picklable numbers, for
+    inclusion in a model snapshot (trainer side). Paired with apply_scaler_state."""
     return {
         "P": (buf.sc_P.min, buf.sc_P.max),
         "Q": (buf.sc_Q.min, buf.sc_Q.max),
@@ -209,7 +256,8 @@ def extract_scaler_state(buf):
 
 
 def apply_scaler_state(buf, state):
-    """Restore scaler state into a buffer's scalers (forecaster side)."""
+    """Restore scaler state (from extract_scaler_state) into a buffer's scalers
+    (forecaster side), so the forecaster normalizes exactly as the trainer did."""
     buf.sc_P.min, buf.sc_P.max = state["P"]
     buf.sc_Q.min, buf.sc_Q.max = state["Q"]
     buf.sc_V.min, buf.sc_V.max = state["V"]
@@ -223,6 +271,14 @@ def apply_scaler_state(buf, state):
 # RETENTION_SEC measured from the newest timestamp.
 # =====================================================
 class RollingBuffer:
+    """Per-node history buffer + normalized-tensor cache + sample indexing.
+
+    Holds each node's recent raw (ts, V, angle, P, Q) rows in time order, bounded
+    to RETENTION_SEC. After each block's scalers update, rebuild_normalized()
+    produces per-node normalized tensors (and a timestamp->row-position map) that
+    the trainer's ReplayDataset and the forecaster read from. Owns the four
+    incremental scalers (their state travels with the model snapshot)."""
+
     def __init__(self, node_names):
         self.node_names = list(node_names)
         self.node_to_id = {n: i for i, n in enumerate(self.node_names)}
@@ -230,36 +286,36 @@ class RollingBuffer:
         self.num_nodes = len(self.node_names)
         # per node_id: deque of (ts, V, ang, P, Q) in time order
         self.raw = {nid: deque() for nid in range(self.num_nodes)}
+        # per-node phase one-hot (static; computed once from the node name)
         self.phase = {
             nid: torch.tensor(encode_phase(n), dtype=torch.float32)
             for nid, n in self.id_to_node.items()
         }
-        # rebuilt each block:
-        self.tensors = (
-            {}
-        )  # nid -> float32 [T,6]: V,ang,P,Q,sin,cos (normalized)
+        # rebuilt each block by rebuild_normalized():
+        self.tensors = {}  # nid -> float32 [T,6]: V,ang,P,Q,sin,cos (normalized)
         self.pos_by_ts = {}  # nid -> {ts: row index}
         self.newest_ts = None
-        # scalers
+        # incremental scalers (V/P/Q min-max, angle standardized)
         self.sc_P = RunningMinMax()
         self.sc_Q = RunningMinMax()
         self.sc_V = RunningMinMax()
         self.sc_ang = RunningStandardizer()
 
     def append_record(self, record):
-        """Add one timestamp's worth of node values (raw)."""
+        """Add one timestamp's worth of node values (raw) to each node's deque."""
         ts = int(record["timestamp"])
         self.newest_ts = ts
         for node_name, vals in record["nodes"].items():
             nid = self.node_to_id.get(node_name)
             if nid is None:
-                continue  # node not seen in first record; fixed node set assumed
+                continue  # node not in the fixed set from the first record
             P = vals["P"] if vals["P"] is not None else 0.0
             Q = vals["Q"] if vals["Q"] is not None else 0.0
             self.raw[nid].append((ts, vals["V"], vals["Angle"], P, Q))
 
     def evict_old(self):
-        """Drop rows older than RETENTION_SEC behind the newest timestamp."""
+        """Drop rows older than RETENTION_SEC behind the newest timestamp
+        (bounds memory regardless of total run length)."""
         if self.newest_ts is None:
             return
         cutoff = self.newest_ts - RETENTION_SEC
@@ -268,7 +324,8 @@ class RollingBuffer:
                 dq.popleft()
 
     def update_scalers_with_block(self, block_start, block_end):
-        """Update running scalers using ONLY this block's raw values (causal)."""
+        """Update the running scalers using ONLY this block's raw values
+        (causal: the model never normalizes using data from the future)."""
         Ps, Qs, Vs, As = [], [], [], []
         for dq in self.raw.values():
             for ts, V, A, P, Q in dq:
@@ -283,9 +340,10 @@ class RollingBuffer:
         self.sc_Q.update(np.asarray(Qs, dtype=np.float64))
 
     def rebuild_normalized(self):
-        """Rebuild per-node normalized tensors + ts->pos maps from raw buffers,
-        using the CURRENT scaler state. Called once per block after scalers update.
-        """
+        """Rebuild per-node normalized tensors + ts->pos maps from the raw
+        buffers using the CURRENT scaler state. Called once per block (after the
+        scalers update) — the forecaster also calls it when adopting a new
+        snapshot. Columns: [V, ang, P, Q, sin_time, cos_time]."""
         self.tensors = {}
         self.pos_by_ts = {}
         for nid, dq in self.raw.items():
@@ -310,18 +368,18 @@ class RollingBuffer:
             self.pos_by_ts[nid] = {int(ts): i for i, ts in enumerate(ts_col)}
 
     def _valid_positions(self, nid):
-        """Positions with full HIST history behind and FUT targets ahead."""
+        """Row positions with a full HIST history behind and FUT targets ahead
+        (i.e. positions that can form a complete training/forecast sample)."""
         T = self.tensors[nid].shape[0]
         return range(HIST, T - FUT)
 
     def build_training_indices(self):
-        """All valid samples in the buffer, subsampled to MAX_WINDOW_SAMPLES.
-        Newest block's samples are always kept; older samples subsampled."""
+        """All valid (nid, position, ts) samples across the retained buffer,
+        subsampled to MAX_WINDOW_SAMPLES if exceeded (bounds train time/memory)."""
         idx = []
         for nid in range(self.num_nodes):
             if nid not in self.tensors:
                 continue
-            tensor = self.tensors[nid]
             pos_ts = {v: k for k, v in self.pos_by_ts[nid].items()}
             for t in self._valid_positions(nid):
                 idx.append((nid, t, pos_ts[t]))
@@ -333,8 +391,8 @@ class RollingBuffer:
         return idx
 
     def build_forecast_indices(self, block_start, block_end):
-        """Samples whose base timestamp is in [block_start, block_end) AND whose
-        FUT targets are all present in the buffer (so we can score them)."""
+        """Samples whose base timestamp is in [block_start, block_end) and whose
+        FUT targets are all present in the buffer (so they can be scored)."""
         fc = []
         for nid in range(self.num_nodes):
             if nid not in self.tensors:
@@ -351,6 +409,11 @@ class RollingBuffer:
 # MODEL
 # =====================================================
 class DNN(nn.Module):
+    """The forecasting network: a per-node embedding concatenated with the
+    input feature vector, through a small MLP that outputs the FUT-step
+    V/angle forecast. The node embedding lets one shared network specialize
+    per node."""
+
     def __init__(self, num_nodes, dropout_p=0.03):
         super().__init__()
         self.node_emb = nn.Embedding(num_nodes, 8)
@@ -370,9 +433,11 @@ class DNN(nn.Module):
 
 
 def build_model(num_nodes):
+    """Construct the model and its training companions on DEVICE.
+    Returns (model, optimizer, scheduler, criterion, amp_scaler). The forecaster
+    calls this too (for a shape-correct model to load snapshots into) and simply
+    ignores the training-only return values."""
     model = DNN(num_nodes=num_nodes, dropout_p=DROPOUT_P).to(DEVICE)
-    # --- FUTURE HOOK (Change 3): model.share_memory() before spawning the
-    #     forecast process so weight updates propagate without files. ---
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer, step_size=3, gamma=0.6
