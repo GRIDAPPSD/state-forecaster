@@ -43,6 +43,8 @@ COMPUTE_LIVE_MAE = True  # deferred scoring: score one forecast per model
 # version against the actual estimates that later
 # arrive. Off for production-speed runs.
 
+# CONFIG (1-based step indices into the FUT-step horizon; None disables per-step MAE)
+COMPUTE_MAE_STEPS = [1, 8, 15]
 
 def build_forecast_json(
     preds, nids, base_ts, buf, base_time=None, simulation_id=None
@@ -301,6 +303,11 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
     pending = None  # {"remaining": set(ts), "pred": {ts: {node: (V, Ang)}},
     #  "abs_v": [...], "abs_a": [...], "n": 0, "version": int}
 
+    if COMPUTE_MAE_STEPS is not None:
+        assert all(1 <= s <= FUT for s in COMPUTE_MAE_STEPS), (
+            f"COMPUTE_MAE_STEPS {COMPUTE_MAE_STEPS} has values outside 1..FUT={FUT}"
+        )
+
     # Forecast-output file: truncate any existing file at startup, then append
     # one JSON line per published forecast (open/append/close per write --
     # durable and handle held across the run). None disables it.
@@ -312,7 +319,8 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
 
     def score_pending(record):
         """Deferred MAE: if this real estimate's timestamp matches a pending
-        forecast step, accumulate abs error (nodes present in both)."""
+        forecast step, accumulate abs error (nodes present in both). Also
+        accumulates per-step MAE for the steps in COMPUTE_MAE_STEPS."""
         nonlocal pending
         if pending is None:
             return
@@ -320,13 +328,22 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
         if ts not in pending["remaining"]:
             return
         pred_at = pending["pred"][ts]
+        step = pending["ts_to_step"][ts]                       # NEW: 1-based step
+        track_step = (COMPUTE_MAE_STEPS is not None
+                      and step in pending["step_v"])           # NEW
         for node, vals in record["nodes"].items():
             p = pred_at.get(node)
             if p is None:
                 continue  # node not in forecast — skip (defensive)
-            pending["abs_v"] += abs(p[0] - vals["V"])
-            pending["abs_a"] += abs(p[1] - vals["Angle"])
+            dv = abs(p[0] - vals["V"])
+            da = abs(p[1] - vals["Angle"])
+            pending["abs_v"] += dv
+            pending["abs_a"] += da
             pending["n"] += 1
+            if track_step:                                      # NEW
+                pending["step_v"][step] += dv                   # NEW
+                pending["step_a"][step] += da                   # NEW
+                pending["step_n"][step] += 1                    # NEW
         pending["remaining"].discard(ts)
         if not pending["remaining"]:  # all horizon steps collected
             n = max(pending["n"], 1)
@@ -337,6 +354,18 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
                 f"Angle MAE (rad): {pending['abs_a']/n:.6f} "
                 f"({pending['n']} node-steps)"
             )
+            if COMPUTE_MAE_STEPS is not None:                   # NEW: per-step line
+                parts = []
+                for s in COMPUTE_MAE_STEPS:
+                    sn = max(pending["step_n"][s], 1)
+                    parts.append(
+                        f"step {s}: V={pending['step_v'][s]/sn:.6f} "
+                        f"A={pending['step_a'][s]/sn:.6f}"
+                    )
+                log.info(
+                    f"[MAE-STEPS] v{pending['version']} base_time="
+                    f"{utc_str(pending['base_time'])} | " + " | ".join(parts)
+                )
             pending = None
 
     def ingest(record):
@@ -461,6 +490,7 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
 
                     if COMPUTE_LIVE_MAE and score_armed:
                         pred = {}
+                        ts_to_step = {}   # forecast_time -> 1-based step index
                         for k in range(FUT):
                             ft = fc_json["Forecast"]["forecast_times"][k]
                             pred[ft] = {
@@ -469,6 +499,7 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
                                     "nodes"
                                 ].items()
                             }
+                            ts_to_step[ft] = k + 1   # 1-based
                         pending = {
                             "remaining": set(pred.keys()),
                             "pred": pred,
@@ -477,6 +508,11 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
                             "n": 0,
                             "version": current_version,
                             "base_time": latest_ts,
+                            "ts_to_step": ts_to_step,                      # NEW
+                            # per-step accumulators for the requested steps:
+                            "step_v": {s: 0.0 for s in (COMPUTE_MAE_STEPS or [])},   # NEW
+                            "step_a": {s: 0.0 for s in (COMPUTE_MAE_STEPS or [])},   # NEW
+                            "step_n": {s: 0 for s in (COMPUTE_MAE_STEPS or [])},     # NEW
                         }
                         score_armed = False
                         log.info(
