@@ -13,7 +13,9 @@ GridLAB-D / OpenDSS (simulation measurements)
     also writes its published estimates directly to a .jsonl file)
      → State Forecaster (THIS app; Python; subscribes, forecasts, publishes forecasts to the bus)
         → other ADMS apps consume forecasts
-```State Estimator outputs** (P, Q, V, Angle per node), one bus message per timestamp.
+```
+
+- **State Estimator outputs** (P, Q, V, Angle per node), one bus message per timestamp.
 - **Origin:** a validated single-process NN script (colleague's, for approach validation + a journal paper). This project turned it into a bus-integrated, streaming, multi-process ADMS service.
 - **Query-free** — no CIM calls; node set is derived from the estimate stream (§9.1).
 
