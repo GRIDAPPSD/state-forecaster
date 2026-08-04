@@ -45,7 +45,7 @@ BATCH_SIZE = 512
 NUM_WORKERS = 0  # DataLoader workers; 0 = load in the main process
 VAL_FRACTION = 0.05  # fraction of a block's samples held out for validation
 
-TRAINER_POLL_SEC = 0.1 # how often a blocked trainer wakes to re-check sim_done
+TRAINER_POLL_SEC = 0.1  # how often a blocked trainer wakes to re-check sim_done
 
 PIN_MEMORY = DEVICE == "cuda"  # pinned memory speeds host->GPU copies
 
@@ -194,13 +194,25 @@ def snapshot_to_bytes(model, buf, version):
 
 
 def trainer_train_block(
-    buf, model, optimizer, scheduler, criterion, scaler_amp,
-    block_start, block_end, block_id, version, model_q, sim_done, log,  # sim_done added
+    buf,
+    model,
+    optimizer,
+    scheduler,
+    criterion,
+    scaler_amp,
+    block_start,
+    block_end,
+    block_id,
+    version,
+    model_q,
+    sim_done,
+    log,  # sim_done added
 ):
     """Process one completed 2-day block: update scalers (causal), rebuild
     normalized tensors, train on the retained buffer, publish the trained
     snapshot (UNLESS the sim ended during this block's training — then the
-    snapshot has no consumer, so skip it), and evict past the retention horizon."""
+    snapshot has no consumer, so skip it), and evict past the retention horizon.
+    """
     buf.update_scalers_with_block(block_start, block_end)
     buf.rebuild_normalized()
     train_idx = buf.build_training_indices()
@@ -216,14 +228,24 @@ def trainer_train_block(
         log.info(f"  block {block_id}: no training samples")
     else:
         train_block(
-            model, optimizer, scheduler, criterion, scaler_amp,
-            tr_idx, val_idx, buf, block_id, log=log.info,
+            model,
+            optimizer,
+            scheduler,
+            criterion,
+            scaler_amp,
+            tr_idx,
+            val_idx,
+            buf,
+            block_id,
+            log=log.info,
         )
     # Publish the snapshot only if the sim is still running. If sim_done was set
     # while this block trained, the forecaster is shutting down and would never
     # consume it, so skip the (expensive) serialize + put.
     if sim_done.is_set():
-        log.info(f"  block {block_id}: sim ended during training — snapshot v{version} not pushed")
+        log.info(
+            f"  block {block_id}: sim ended during training — snapshot v{version} not pushed"
+        )
     else:
         model_q.put(snapshot_to_bytes(model, buf, version))
         log.info(f"pushed model snapshot v{version}")
@@ -294,11 +316,21 @@ def trainer_proc(train_data_q, model_q, sim_done):
             block_id += 1
             version += 1
             trainer_train_block(
-                buf, model, optimizer, scheduler, criterion, scaler_amp,
-                block_start, block_end, block_id, version, model_q, sim_done, log,
+                buf,
+                model,
+                optimizer,
+                scheduler,
+                criterion,
+                scaler_amp,
+                block_start,
+                block_end,
+                block_id,
+                version,
+                model_q,
+                sim_done,
+                log,
             )
             block_start = block_end
             block_end = block_start + BLOCK_SEC
 
         buf.append_record(record)
-

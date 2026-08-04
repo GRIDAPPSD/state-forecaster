@@ -608,4 +608,3 @@ def forecaster_proc(fc_data_q, model_q, sim_done, gappsd_simid):
         # time to arrive before the next exit check)
         if not records and snap is None:
             time.sleep(FORECASTER_POLL_SEC)
-
