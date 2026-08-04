@@ -26,7 +26,6 @@ from forecast_common import (
     setup_logger,
     LOG_DIR,
     TS_INCREMENT_SEC,
-    DONE,
 )
 
 FEEDER_LOG = f"{LOG_DIR}/data_feeder.log"
@@ -263,13 +262,13 @@ def feeder_proc(train_data_q, fc_data_q, sim_done, gappsd_simid):
     Reads state estimates from the GridAPPS-D bus (if gappsd_simid is given) or
     from a .jsonl file (otherwise), runs each through the imputer, and enqueues
     the results to the trainer and forecaster data queues. On end-of-stream,
-    sets the sim_done Event, sends the DONE sentinel to both queues, and
-    releases the queues' background threads so the process can exit cleanly.
+    sets the sim_done Event and releases the queues' background threads so
+    the process can exit cleanly.
 
     Args:
         train_data_q: queue to the trainer (keep-all).
         fc_data_q:    queue to the forecaster (keep-all).
-        sim_done:     shared Event set at end-of-stream (trainer's stop signal).
+        sim_done:     shared Event set at end-of-stream.
         gappsd_simid: GridAPPS-D simulation id -> bus mode; None -> file mode.
     """
     log = setup_logger("data_feeder", FEEDER_LOG)
@@ -368,17 +367,13 @@ def feeder_proc(train_data_q, fc_data_q, sim_done, gappsd_simid):
         for record in read_json_records(JSON_PATH):
             emit(record, pace=True)
 
-    # --- end-of-stream shutdown (both drivers converge here) ---
-    # Set sim_done FIRST so the trainer's stop signal is live before DONE lands
-    # on the queues, then send DONE to both consumers. cancel_join_thread lets
-    # this process exit without blocking on any records the consumers haven't
-    # drained (they honor DONE and abandon the rest).
+    # --- end-of-stream: signal completion via the shared Event ---
+    # sim_done is the single shutdown signal. Set it after all real records
+    # have been enqueued so consumers drain the full tail.
     sim_done.set()
-    train_data_q.put(DONE)
-    fc_data_q.put(DONE)
     log.info(
         f"DATA_FEEDER done | total={n_real} real + {n_imp} imputed "
-        f"| last_ts={utc_str(last_ts) if last_ts else 'n/a'} | sent DONE"
+        f"| last_ts={utc_str(last_ts) if last_ts else 'n/a'} | sim_done set"
     )
     train_data_q.cancel_join_thread()
     fc_data_q.cancel_join_thread()

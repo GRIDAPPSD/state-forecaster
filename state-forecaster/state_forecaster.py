@@ -51,8 +51,7 @@ def main():
     #                Consumer takes latest-only via drain_latest (snapshots are
     #                infrequent, so an unbounded queue stays shallow).
     # sim_done     : one-shot Event the feeder sets at end-of-stream so the
-    #                trainer can stop promptly (rather than draining/training
-    #                queued blocks no forecaster will consume).
+    #                trainer and forecaster can exit cleanly.
     train_data_q = mp.Queue()
     fc_data_q = mp.Queue()
     model_q = mp.Queue()
@@ -71,7 +70,7 @@ def main():
         ),
         mp.Process(
             target=forecaster_proc,
-            args=(fc_data_q, model_q, gappsd_simid),
+            args=(fc_data_q, model_q, sim_done, gappsd_simid),
             name="forecaster",
         ),
     ]
@@ -82,9 +81,6 @@ def main():
         p.start()
 
     try:
-        # Normal shutdown chain: feeder finishes -> sends DONE (+ sets sim_done)
-        # -> trainer finalizes and sends DONE to the model queue -> forecaster
-        # sees DONE on both its queues -> all three exit -> the joins return.
         for p in procs:
             p.join()
         bad = [p for p in procs if p.exitcode not in (0, None)]

@@ -15,12 +15,13 @@ serialization), and trainer_proc (the process entry point).
 """
 
 import io
+import queue
 import numpy as np
 
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from forecast_common import utc_str, setup_logger, LOG_DIR, DONE
+from forecast_common import utc_str, setup_logger, LOG_DIR
 from forecast_dnn import (
     RollingBuffer,
     build_model,
@@ -43,6 +44,8 @@ EPOCHS_PER_BLOCK = 8  # max epochs per block (early stopping may cut short)
 BATCH_SIZE = 512
 NUM_WORKERS = 0  # DataLoader workers; 0 = load in the main process
 VAL_FRACTION = 0.05  # fraction of a block's samples held out for validation
+
+TRAINER_POLL_SEC = 0.1 # how often a blocked trainer wakes to re-check sim_done
 
 PIN_MEMORY = DEVICE == "cuda"  # pinned memory speeds host->GPU copies
 
@@ -191,29 +194,15 @@ def snapshot_to_bytes(model, buf, version):
 
 
 def trainer_train_block(
-    buf,
-    model,
-    optimizer,
-    scheduler,
-    criterion,
-    scaler_amp,
-    block_start,
-    block_end,
-    block_id,
-    version,
-    model_q,
-    log,
+    buf, model, optimizer, scheduler, criterion, scaler_amp,
+    block_start, block_end, block_id, version, model_q, sim_done, log,  # sim_done added
 ):
-    """Process one completed 2-day block end to end: update the incremental
-    scalers with this block's raw values (causal), rebuild the normalized
-    tensors, train on the whole retained buffer, publish the trained snapshot,
-    and evict rows past the retention horizon."""
-    # 1) Causal scaler update using ONLY this block's raw values.
+    """Process one completed 2-day block: update scalers (causal), rebuild
+    normalized tensors, train on the retained buffer, publish the trained
+    snapshot (UNLESS the sim ended during this block's training — then the
+    snapshot has no consumer, so skip it), and evict past the retention horizon."""
     buf.update_scalers_with_block(block_start, block_end)
-    # 2) Rebuild normalized tensors from the raw buffers with updated scalers.
     buf.rebuild_normalized()
-    # 3) Build the training set from the whole retained buffer (subsampled to
-    #    MAX_WINDOW_SAMPLES inside build_training_indices), then split off val.
     train_idx = buf.build_training_indices()
     np.random.shuffle(train_idx)
     n_val = int(len(train_idx) * VAL_FRACTION)
@@ -224,45 +213,36 @@ def trainer_train_block(
         f"| train={len(tr_idx)} val={len(val_idx)}"
     )
     if len(tr_idx) == 0:
-        # Too little data for any training sample (e.g. a very short run);
-        # push current weights anyway so the forecaster still gets a snapshot.
-        log.info(
-            f"  block {block_id}: no training samples — pushing current weights"
-        )
+        log.info(f"  block {block_id}: no training samples")
     else:
-        # train_block logs epoch/loss via log.info -> lands in trainer.log.
         train_block(
-            model,
-            optimizer,
-            scheduler,
-            criterion,
-            scaler_amp,
-            tr_idx,
-            val_idx,
-            buf,
-            block_id,
-            log=log.info,
+            model, optimizer, scheduler, criterion, scaler_amp,
+            tr_idx, val_idx, buf, block_id, log=log.info,
         )
-    # 4) Publish the trained snapshot (weights + scaler state) to the forecaster.
-    model_q.put(snapshot_to_bytes(model, buf, version))
-    log.info(f"pushed model snapshot v{version}")
-    # 5) Evict rows older than the retention horizon to bound memory.
+    # Publish the snapshot only if the sim is still running. If sim_done was set
+    # while this block trained, the forecaster is shutting down and would never
+    # consume it, so skip the (expensive) serialize + put.
+    if sim_done.is_set():
+        log.info(f"  block {block_id}: sim ended during training — snapshot v{version} not pushed")
+    else:
+        model_q.put(snapshot_to_bytes(model, buf, version))
+        log.info(f"pushed model snapshot v{version}")
     buf.evict_old()
 
 
 def trainer_proc(train_data_q, model_q, sim_done):
     """Trainer process entry point.
 
-    Consumes records from the keep-all data queue into its own RollingBuffer,
-    training and publishing a model snapshot each time a 2-day block boundary is
-    crossed. Exits promptly when the simulation ends — either the sim_done Event
-    is set or a DONE sentinel arrives on the queue — training NO further blocks
-    (once the sim is over there is no forecaster consumer for more snapshots).
+    Consumes records into its own RollingBuffer, training and publishing a model
+    snapshot each time a 2-day block boundary is crossed. Shutdown is driven
+    solely by the shared sim_done Event: once set, the trainer trains no
+    further blocks and exits, abandoning any queued backlog.  A block already
+    mid-training finishes (its push is suppressed — see trainer_train_block).
 
     Args:
         train_data_q: keep-all queue of records from the data feeder.
-        model_q:      queue this process PUTs model snapshots on (+ DONE at end).
-        sim_done:     shared Event; when set, stop training and exit.
+        model_q:      queue this process PUTs model snapshots on.
+        sim_done:     shared Event; when set, stop and exit.
     """
     log = setup_logger("trainer", TRAINER_LOG)
     log.info("TRAINER start")
@@ -274,33 +254,22 @@ def trainer_proc(train_data_q, model_q, sim_done):
     version = 0
 
     while True:
-        # End-of-sim check BEFORE blocking on the queue: stop immediately, train
-        # nothing further, and forward DONE so the forecaster shuts down too.
+        # Shutdown: the sim is over -> train no further blocks, abandon backlog.
         if sim_done.is_set():
-            model_q.put(DONE)
-            log.info(
-                "TRAINER received DONE event → sent DONE to model queue → exit"
-            )
+            log.info("TRAINER sim_done → exit (no further training)")
             train_data_q.cancel_join_thread()
             model_q.cancel_join_thread()
             return
 
-        item = train_data_q.get()  # blocking; keep-all FIFO
-        # DONE on the data queue is a backstop for the sim_done Event; same exit.
-        if isinstance(item, str) and item == DONE:
-            model_q.put(DONE)
-            log.info(
-                "TRAINER received DONE on queue → sent DONE to model queue → exit"
-            )
-            train_data_q.cancel_join_thread()
-            model_q.cancel_join_thread()
-            return
+        # Timeout get so a blocked trainer periodically wakes to re-check
+        # sim_done
+        try:
+            record = train_data_q.get(timeout=TRAINER_POLL_SEC)
+        except queue.Empty:
+            continue
 
-        record = item
         ts = int(record["timestamp"])
 
-        # Lazy init from the first record: discover the node set and build the
-        # buffer + model/optimizer/etc. once, and anchor the first block window.
         if buf is None:
             node_names = sorted(record["nodes"].keys())
             buf = RollingBuffer(node_names)
@@ -314,37 +283,22 @@ def trainer_proc(train_data_q, model_q, sim_done):
                 f"| block_end={utc_str(block_end)}"
             )
 
-        # Close out any completed block(s) before ingesting this record. A
-        # single far-future record can cross several boundaries, so this loops;
-        # the sim_done check inside prevents training a pile of queued blocks at
-        # end-of-sim (which would have no forecaster consumer).
+        # Close out completed block(s). Check sim_done before each so we don't
+        # train a pile of queued blocks at end-of-sim (no forecaster consumer).
         while ts >= block_end:
             if sim_done.is_set():
-                model_q.put(DONE)
-                log.info(
-                    "TRAINER received DONE event mid-catchup "
-                    "→ sent DONE to model queue → exit"
-                )
+                log.info("TRAINER sim_done mid-catchup → exit")
                 train_data_q.cancel_join_thread()
                 model_q.cancel_join_thread()
                 return
             block_id += 1
             version += 1
             trainer_train_block(
-                buf,
-                model,
-                optimizer,
-                scheduler,
-                criterion,
-                scaler_amp,
-                block_start,
-                block_end,
-                block_id,
-                version,
-                model_q,
-                log,
+                buf, model, optimizer, scheduler, criterion, scaler_amp,
+                block_start, block_end, block_id, version, model_q, sim_done, log,
             )
             block_start = block_end
             block_end = block_start + BLOCK_SEC
 
         buf.append_record(record)
+

@@ -24,10 +24,6 @@ LOG_DIR = "./logs"
 TS_INCREMENT_SEC = 300  # 5-minute increment
 # TS_INCREMENT_SEC = 900   # 15-minute increment
 
-# Sentinel value placed on inter-process queues to signal end-of-stream.
-# (A distinguished queue item, not an OS signal — consumers stop on receipt.)
-DONE = "__DONE__"
-
 
 def utc_str(epoch_sec):
     """Format an epoch-seconds timestamp as a UTC 'YYYY-MM-DD HH:MM:SS' string.

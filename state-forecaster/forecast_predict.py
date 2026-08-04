@@ -40,7 +40,6 @@ from forecast_common import (
     setup_logger,
     LOG_DIR,
     TS_INCREMENT_SEC,
-    DONE,
 )
 from forecast_dnn import (
     RollingBuffer,
@@ -138,41 +137,28 @@ def build_forecast_json(
 # QUEUE HELPERS
 # =====================================================
 def drain_latest(q):
-    """Consumer-side drain returning (latest_non_DONE_item, saw_done).
-    Keeps only the newest real item (older ones discarded); reports whether a
-    DONE sentinel was seen (never lost, even alongside a real item). Used for
-    the model queue, where only the newest snapshot matters. Non-blocking;
-    returns (None, False) if the queue was empty."""
+    """Non-blocking drain returning only the NEWEST item (or None if empty).
+    Older items are discarded — used for the model queue, where only the latest
+    snapshot matters."""
     latest = None
-    saw_done = False
     try:
         while True:
-            item = q.get_nowait()
-            if isinstance(item, str) and item == DONE:
-                saw_done = True
-            else:
-                latest = item
+            latest = q.get_nowait()
     except queue.Empty:
         pass
-    return latest, saw_done
+    return latest
 
 
 def drain_all(q):
-    """Drain ALL pending items in order, returning (records_list, saw_done).
-    Used for the forecaster's keep-all data queue so recent history stays
-    gapless (every record is kept, unlike drain_latest). Non-blocking."""
+    """Non-blocking drain returning ALL currently-available items in order.
+    Used for the forecaster's keep-all data queue so history stays gapless."""
     records = []
-    saw_done = False
     try:
         while True:
-            item = q.get_nowait()
-            if isinstance(item, str) and item == DONE:
-                saw_done = True
-            else:
-                records.append(item)
+            records.append(q.get_nowait())
     except queue.Empty:
         pass
-    return records, saw_done
+    return records
 
 
 # =====================================================
@@ -308,18 +294,18 @@ def forecast_latest(model, store, buf, latest_ts, log):
 # =====================================================
 # FORECASTER PROCESS
 # =====================================================
-def forecaster_proc(fc_data_q, model_q, gappsd_simid):
+def forecaster_proc(fc_data_q, model_q, sim_done, gappsd_simid):
     """Forecaster process entry point.
 
     Loop: adopt the newest model snapshot if any (model queue first), ingest all
     newly-arrived estimates (keeping history gapless), forecast the latest real
     timestamp, publish/record it, and — if enabled — score a held forecast per
-    model version. Exits once end-of-stream has been seen on BOTH the data queue
-    and the model queue (each latched via a sticky flag).
+    model version. Exits once end-of-stream has been seen.
 
     Args:
         fc_data_q:    keep-all queue of records from the data feeder.
-        model_q:      queue of model snapshots from the trainer (+ DONE at end).
+        model_q:      queue of model snapshots from the trainer.
+        sim_done:     end-of-stream sentinel.
         gappsd_simid: GridAPPS-D sim id -> publish to the bus; None -> file only.
     """
     log = setup_logger("forecaster", FORECASTER_LOG)
@@ -355,8 +341,6 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
     have_scalers = False  # True once first snapshot applied
     current_version = 0
     pending_snap = None  # snapshot that arrived before the first data record
-    data_done = False  # sticky: DONE seen on the data queue
-    model_done = False  # sticky: DONE seen on the model queue
     fc_count = 0
     warmup_logged = False
 
@@ -457,14 +441,10 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
             store.evict_before(cutoff)  # normalized
 
     while True:
-        # 1) MODEL QUEUE FIRST: adopt newest snapshot (weights + scalers), and
-        #    latch model_done if the trainer's DONE has arrived.
-        snap, model_saw_done = drain_latest(model_q)
-        if model_saw_done:
-            model_done = True  # sticky, like data_done
+        # 1) MODEL QUEUE FIRST: adopt the newest snapshot if present.
+        snap = drain_latest(model_q)
         if snap is not None:
             if buf is None:
-                # Snapshot arrived before any data; stash and apply after init.
                 pending_snap = snap
             else:
                 blob = torch.load(io.BytesIO(snap["blob"]), map_location="cpu")
@@ -482,10 +462,7 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
                 )
 
         # 2) DATA QUEUE: drain ALL (keep-all, gapless), ingest in order.
-        records, data_saw_done = drain_all(fc_data_q)
-        if data_saw_done:
-            data_done = True
-
+        records = drain_all(fc_data_q)
         latest_ts = None
         latest_imputed = False
         for record in records:
@@ -602,12 +579,16 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
                     )
                     warmup_logged = True
 
-        # 4) Shutdown once end-of-stream is seen on BOTH queues (sticky flags).
-        # The two DONEs arrive at different times (feeder finishes well before
-        # the trainer's final snapshot), so each is latched independently.
-        if data_done and model_done:
+        # 4) Shutdown: the sim is over AND we've fully drained the data queue
+        # (and adopted any pending snapshot). sim_done is set by the feeder
+        # AFTER its last data put, so an empty drain here means the tail is done.
+        # NOTE: Event vs. queue-FIFO means a just-put tail record could in
+        # theory still be in transit; benign in practice (throttled: records
+        # arrive seconds apart; fast: forecasting is mostly skipped). If a hard
+        # guarantee is ever needed, require two consecutive empty drains here.
+        if sim_done.is_set() and not records and snap is None:
             log.info(
-                f"FORECASTER received DONE on both queues → exit "
+                f"FORECASTER sim_done + drained → exit "
                 f"(total forecasts: {fc_count}, final model v{current_version})"
             )
             # Signal end-of-forecasts to our own downstream consumers (symmetry
@@ -623,6 +604,8 @@ def forecaster_proc(fc_data_q, model_q, gappsd_simid):
             model_q.cancel_join_thread()
             return
 
-        # 5) Avoid busy-spin when there was nothing to do this cycle.
+        # 5) avoid busy-spin when idle (also gives any in-transit tail records
+        # time to arrive before the next exit check)
         if not records and snap is None:
             time.sleep(FORECASTER_POLL_SEC)
+
