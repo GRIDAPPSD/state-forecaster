@@ -5,7 +5,7 @@ Last updated: August 6, 2026
 
 ## Purpose
 
-The state-forecaster directory of the state-forecaster repository contains the entirety of the FY26 GridAPPS-D application deliverable that uses state estimates to forecast future state. The prototype directory contains developmental code that evolved into the full application and now serves as a reference for the full application design and implementation (the prototype is not needed to run the application). Note there are several versions of the prototype summary in that directory that are useful in seeing the evolution of the design and code.
+The state-forecaster directory of the state-forecaster repository contains the entirety of the FY26 GridAPPS-D application deliverable that uses state estimates to forecast future state. The prototype directory contains developmental code that evolved into the full application and now serves as a reference for the application design and implementation (the prototype is not needed to run the application). Note there are several versions of the prototype summary in that directory that are useful in seeing the evolution of the design and code.
 
 ## Overview
 
