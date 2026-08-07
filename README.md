@@ -56,7 +56,7 @@ $ python
 
 If the import returns an error message, see <https://github.com/GRIDAPPSD/gridappsd-python> for installation instructions. You may need to do a "sudo apt install python-pip" to be able to do the "sudo pip install gridappsd-python" needed to install this package.
 
-Various other Python packages are required to run State Forecaster and can be installed with "sudo pip install <package>" if not already installed (check with import statements in the Python command-line interpreter). These packages include numpy and torch.
+Various other Python packages are required to run State Forecaster and can be installed with "sudo pip install <package>" if not already installed (check with import statements in the Python command-line interpreter). These packages include numpy and torch. Start by installing these two packages if you don't have them and then try running the app to see if it calls out any others on failed imports.
 
 ## Running State Forecaster
 
