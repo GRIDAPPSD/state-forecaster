@@ -33,7 +33,8 @@ FEEDER_LOG = f"{LOG_DIR}/data_feeder.log"
 # Input file for FILE-DRIVER mode (used when no GridAPPS-D sim id is given).
 # Uncomment the one matching the model / increment being tested;UST match TS_INCREMENT_SEC (the startup cadence check will complain if not).
 # JSON_PATH = "results_data_forecasting_13_1min.jsonl"
-JSON_PATH = "results_data_forecasting_13_5min.jsonl"
+# JSON_PATH = "results_data_forecasting_13_5min.jsonl"
+JSON_PATH = "results_data_forecasting_13_4weeks.jsonl"
 # JSON_PATH = "results_data_forecasting_13_15min.jsonl"
 # JSON_PATH = "results_data_forecasting_123_5min.jsonl"
 
@@ -43,7 +44,8 @@ JSON_PATH = "results_data_forecasting_13_5min.jsonl"
 # training can consume it, so a run may finish before much forecasting occurs.
 # FEED_RATE_HZ = 1.0
 # FEED_RATE_HZ = 4.0
-FEED_RATE_HZ = 50.0
+FEED_RATE_HZ = 10.0
+# FEED_RATE_HZ = 50.0
 
 FEEDER_POLL_SEC = 0.05  # bus-driver idle sleep while waiting for messages
 

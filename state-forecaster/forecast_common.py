@@ -20,8 +20,8 @@ LOG_DIR = "./logs"
 # guard in the data_feeder enforces this at runtime). Also must divide evenly
 # into the day/week lag intervals. Uncomment the value matching the run:
 # TS_INCREMENT_SEC = 3     # real-time simulation cadence
-# TS_INCREMENT_SEC = 60    # 1-minute increment
-TS_INCREMENT_SEC = 300  # 5-minute increment
+TS_INCREMENT_SEC = 60    # 1-minute increment
+#TS_INCREMENT_SEC = 300  # 5-minute increment
 # TS_INCREMENT_SEC = 600   # 10-minute increment
 # TS_INCREMENT_SEC = 900   # 15-minute increment
 
