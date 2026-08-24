@@ -34,17 +34,19 @@ FEEDER_LOG = f"{LOG_DIR}/data_feeder.log"
 # Uncomment the one matching the model / increment being tested;UST match TS_INCREMENT_SEC (the startup cadence check will complain if not).
 # JSON_PATH = "results_data_forecasting_13_1min.jsonl"
 # JSON_PATH = "results_data_forecasting_13_5min.jsonl"
-JSON_PATH = "results_data_forecasting_13_4weeks.jsonl"
+# JSON_PATH = "results_data_forecasting_13_4weeks.jsonl"
+JSON_PATH = "results_data_forecasting_123_4weeks.jsonl"
 # JSON_PATH = "results_data_forecasting_13_15min.jsonl"
 # JSON_PATH = "results_data_forecasting_123_5min.jsonl"
 
 # FILE-DRIVER pacing: records/sec the feeder emits. Real estimates arrive ~1/s;
 # rates >1 just speed up file-based testing. (Bus driver is not paced — it
 # emits as messages arrive.) Note: very high rates make data arrive faster than
-# training can consume it, so a run may finish before much forecasting occurs.
+# training can consume it, so forecasts will not be based on as much and recent
+# training data as they could be.
 # FEED_RATE_HZ = 1.0
-# FEED_RATE_HZ = 4.0
-FEED_RATE_HZ = 10.0
+FEED_RATE_HZ = 4.0
+# FEED_RATE_HZ = 10.0
 # FEED_RATE_HZ = 50.0
 
 FEEDER_POLL_SEC = 0.05  # bus-driver idle sleep while waiting for messages
